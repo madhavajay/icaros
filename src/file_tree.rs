@@ -31,12 +31,10 @@ impl TreeNode {
 
     pub fn toggle_lock(&mut self) {
         self.is_locked = !self.is_locked;
-        if self.is_locked {
+        if !self.is_locked {
             self.allow_create_in_locked = false;
-            self.lock_all_children();
-        } else {
-            self.unlock_all_children();
         }
+        // Don't automatically lock/unlock children - that's handled by the UI
     }
     
     pub fn toggle_create_in_locked(&mut self) {
@@ -46,20 +44,13 @@ impl TreeNode {
     }
 
     pub fn lock_all_children(&mut self) {
-        self.is_locked = true;
-        self.allow_create_in_locked = false;
         for child in &mut self.children {
+            child.is_locked = true;
+            child.allow_create_in_locked = false;
             child.lock_all_children();
         }
     }
 
-    fn unlock_all_children(&mut self) {
-        self.is_locked = false;
-        self.allow_create_in_locked = false;
-        for child in &mut self.children {
-            child.unlock_all_children();
-        }
-    }
 
     pub fn toggle_expand(&mut self) {
         if self.is_dir {
@@ -79,7 +70,7 @@ impl TreeNode {
     }
 }
 
-pub fn build_tree(root_path: &Path, ignore_patterns: &[String]) -> Result<TreeNode> {
+pub fn build_tree(root_path: &Path, ignore_patterns: &[String], show_hidden: bool) -> Result<TreeNode> {
     let root_name = root_path.file_name()
         .unwrap_or_default()
         .to_string_lossy()
@@ -96,7 +87,7 @@ pub fn build_tree(root_path: &Path, ignore_patterns: &[String]) -> Result<TreeNo
         let entry = entry?;
         let path = entry.path();
         
-        if should_ignore(path, ignore_patterns) {
+        if should_ignore(path, ignore_patterns, show_hidden) {
             continue;
         }
         
@@ -128,12 +119,24 @@ pub fn build_tree(root_path: &Path, ignore_patterns: &[String]) -> Result<TreeNo
     Ok(root)
 }
 
-fn should_ignore(path: &Path, patterns: &[String]) -> bool {
+fn should_ignore(path: &Path, patterns: &[String], show_hidden: bool) -> bool {
     let path_str = path.to_string_lossy();
     
+    // Always ignore these directories
     if path_str.contains("/.git/") || path_str.contains("/target/") || 
        path_str.contains("/node_modules/") || path_str.contains("/.idea/") {
         return true;
+    }
+    
+    // Check if it's a hidden file (starts with .)
+    if !show_hidden {
+        if let Some(file_name) = path.file_name() {
+            if let Some(name_str) = file_name.to_str() {
+                if name_str.starts_with('.') && name_str != "." && name_str != ".." {
+                    return true;
+                }
+            }
+        }
     }
     
     for pattern in patterns {

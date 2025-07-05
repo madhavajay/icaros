@@ -34,14 +34,25 @@ cargo run -- --state-file custom_state.json
 
 # Add custom ignore patterns
 cargo run -- --ignore "*.tmp" --ignore "cache/*"
+
+# Initialize CLAUDE.md and ICAROS.md files
+cargo run -- init
 ```
 
-## Controls
+## Commands
+
+### `icaros init`
+Creates or updates `CLAUDE.md` and `ICAROS.md` files in the current directory with instructions for AI assistants about the file lock system. Templates are customizable - see the Template System section below.
+
+### Interactive Mode Controls
 
 - **↑/↓**: Navigate through the file tree
 - **Space**: Toggle lock/unlock on selected file/directory
 - **c**: Toggle "allow create" on locked directories only
 - **Enter**: Expand/collapse directories
+- **h**: Toggle hidden files visibility
+- **r**: Refresh file tree
+- **a**: Toggle animations
 - **q**: Quit
 
 ## Auto-Save
@@ -101,6 +112,85 @@ Example integration:
 2. Parse the `locked_files` array
 3. Before modifying any file, check if its absolute path is in the locked files list
 4. If locked, skip the modification and inform the user
+
+## Template System
+
+The markdown prompts used by `icaros init` are extracted into separate `.md` files for easy customization.
+
+### Template Structure
+
+```
+prompts/
+├── README.md         # Documentation for the template system
+├── ICAROS.md        # Main file lock system guide
+├── CLAUDE.md        # Template for new CLAUDE.md files
+└── CLAUDE_UPDATE.md # Template for updating existing CLAUDE.md
+```
+
+### Template Loading Priority
+
+The system loads templates in this order:
+
+1. **User Config Directory** (if exists)
+   - macOS: `~/Library/Application Support/icaros/prompts/`
+   - Linux: `~/.config/icaros/prompts/`
+   - Windows: `%APPDATA%\icaros\prompts\`
+
+2. **Application Directory**
+   - `./prompts/` relative to the binary
+
+3. **Embedded Defaults**
+   - Compiled into the binary using `include_str!`
+
+### Customization Methods
+
+#### Method 1: Edit Application Templates
+
+Simply edit the files in the `prompts/` directory before building:
+
+```bash
+# Edit the templates
+vim prompts/ICAROS.md
+
+# Build with your changes
+cargo build --release
+```
+
+#### Method 2: User-Specific Templates
+
+Create your own templates that override the defaults:
+
+```bash
+# macOS example
+mkdir -p ~/Library/Application\ Support/icaros/prompts
+cp prompts/ICAROS.md ~/Library/Application\ Support/icaros/prompts/
+# Edit with your customizations
+vim ~/Library/Application\ Support/icaros/prompts/ICAROS.md
+```
+
+#### Method 3: Fork and Customize
+
+Fork the repository and maintain your own version with custom templates.
+
+### Template Variables
+
+The `CLAUDE_UPDATE.md` template supports:
+- `{existing_content}` - Replaced with existing CLAUDE.md content
+
+### Benefits
+
+1. **Easy Customization** - No need to edit Rust code
+2. **User Overrides** - Personal templates without modifying the app
+3. **Version Control** - Track template changes separately
+4. **Distribution** - Bundle templates with the binary
+5. **Flexibility** - Different templates for different users/orgs
+
+### Example Use Cases
+
+- Add organization-specific guidelines to ICAROS.md
+- Include project templates in CLAUDE.md
+- Customize the update behavior for existing files
+- Create templates in different languages
 
 ## Future Enhancements
 

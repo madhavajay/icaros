@@ -11,7 +11,7 @@ fn test_build_tree() {
     fs::write(temp_dir.join("src/main.rs"), "fn main() {}").unwrap();
     fs::write(temp_dir.join("README.md"), "# Test").unwrap();
     
-    let tree = file_tree::build_tree(&temp_dir, &[]).unwrap();
+    let tree = file_tree::build_tree(&temp_dir, &[], false).unwrap();
     
     assert_eq!(tree.name, "claude_tree_test");
     assert!(tree.is_dir);
@@ -83,8 +83,15 @@ fn test_tree_node_with_children() {
     parent.children.push(child2);
     
     parent.toggle_lock();
-    
     assert!(parent.is_locked);
+    
+    // Now children are NOT automatically locked when parent is toggled
+    // This is the new behavior - only explicit locks and inheritance during refresh
+    assert!(!parent.children[0].is_locked);
+    assert!(!parent.children[1].is_locked);
+    
+    // Manually lock children to test get_locked_files
+    parent.lock_all_children();
     assert!(parent.children[0].is_locked);
     assert!(parent.children[1].is_locked);
     

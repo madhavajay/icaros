@@ -15,6 +15,9 @@ use ratatui::{
 use std::io;
 use std::time::{Duration, Instant};
 use anyhow::Result;
+use std::sync::mpsc::{channel, Receiver};
+use notify::{Watcher, RecursiveMode, Event as NotifyEvent};
+use std::collections::HashSet;
 
 pub struct App {
     pub tree: TreeNode,
@@ -29,6 +32,11 @@ pub struct App {
     pub llama_x: f32,
     pub day_night_cycle: f32,
     pub wave_offset: f32,
+    pub needs_refresh: bool,
+    pub last_refresh: Instant,
+    pub explicitly_locked_paths: Vec<std::path::PathBuf>,
+    pub explicitly_unlocked_paths: Vec<std::path::PathBuf>,
+    pub show_hidden: bool,
 }
 
 
@@ -86,6 +94,11 @@ impl App {
             llama_x: 0.0,
             day_night_cycle: 0.0,
             wave_offset: 0.0,
+            needs_refresh: false,
+            last_refresh: Instant::now(),
+            explicitly_locked_paths: Vec::new(),
+            explicitly_unlocked_paths: Vec::new(),
+            show_hidden: false,
         };
         app.update_items();
         app.list_state.select(Some(0));
@@ -116,6 +129,11 @@ impl App {
     }
 
     fn collect_visible_nodes(&mut self, node: &TreeNode, indent: usize) {
+        // Skip hidden files unless show_hidden is true
+        if !self.show_hidden && node.name.starts_with('.') && indent > 0 {
+            return;
+        }
+        
         self.items.push((node.clone(), indent));
         
         if node.is_dir && node.is_expanded {
@@ -128,10 +146,179 @@ impl App {
     pub fn toggle_selected(&mut self) {
         if self.selected < self.items.len() {
             let path = self.items[self.selected].0.path.clone();
-            toggle_node_at_path(&mut self.tree, &path);
+            let is_dir = self.items[self.selected].0.is_dir;
+            
+            // Determine the effective lock state of this path
+            let was_locked = self.is_path_effectively_locked(&path);
+            
+            if std::env::var("ICAROS_DEBUG").is_ok() {
+                eprintln!("Toggle: {:?}, was_locked: {}", path, was_locked);
+                eprintln!("  Explicitly locked: {:?}", self.explicitly_locked_paths);
+                eprintln!("  Explicitly unlocked: {:?}", self.explicitly_unlocked_paths);
+            }
+            
+            
+            if !was_locked {
+                // LOCKING a node
+                self.explicitly_locked_paths.push(path.clone());
+                
+                // Remove this path from explicitly unlocked if it was there
+                self.explicitly_unlocked_paths.retain(|p| p != &path);
+                
+                // If locking a directory, clean up redundant child states
+                if is_dir {
+                    // Remove child locks (they're now redundant)
+                    self.explicitly_locked_paths.retain(|p| !p.starts_with(&path) || p == &path);
+                    // Remove child unlocks (they're overridden by the lock)
+                    self.explicitly_unlocked_paths.retain(|p| !p.starts_with(&path));
+                }
+            } else {
+                // UNLOCKING a node
+                // First check if this is an explicit lock
+                let is_explicitly_locked = self.explicitly_locked_paths.contains(&path);
+                
+                if is_explicitly_locked {
+                    // Remove the explicit lock
+                    self.explicitly_locked_paths.retain(|p| p != &path);
+                    
+                    // If unlocking a directory that was explicitly locked,
+                    // remove redundant child states
+                    if is_dir {
+                        // Remove child locks (parent is now unlocked)
+                        self.explicitly_locked_paths.retain(|p| !p.starts_with(&path));
+                        // Remove child unlocks (they're redundant now)
+                        self.explicitly_unlocked_paths.retain(|p| !p.starts_with(&path));
+                    }
+                } else {
+                    // This is an inherited lock, check if we need to explicitly unlock
+                    let has_locked_parent = self.has_locked_ancestor(&path);
+                    
+                    if has_locked_parent {
+                        // Add explicit unlock
+                        self.explicitly_unlocked_paths.push(path.clone());
+                        
+                        // If unlocking a directory, remove child states
+                        if is_dir {
+                            // Remove child locks
+                            self.explicitly_locked_paths.retain(|p| !p.starts_with(&path) || p == &path);
+                            // Remove child unlocks
+                            self.explicitly_unlocked_paths.retain(|p| !p.starts_with(&path) || p == &path);
+                        }
+                    }
+                }
+            }
+            
+            // Clean up redundant entries
+            self.cleanup_lock_lists();
+            
+            
+            // Reapply all locks to ensure correct state
+            self.reapply_explicit_locks();
+            
             self.update_items();
+            
+            // Ensure selection stays on the same path
+            for (i, (item_node, _)) in self.items.iter().enumerate() {
+                if item_node.path == path {
+                    self.selected = i;
+                    self.list_state.select(Some(i));
+                    break;
+                }
+            }
+            
             self.save_state();
         }
+    }
+    
+    fn is_path_effectively_locked(&self, path: &std::path::Path) -> bool {
+        // First check if this exact path is explicitly unlocked
+        if self.explicitly_unlocked_paths.contains(&path.to_path_buf()) {
+            return false;
+        }
+        
+        // Then check if this exact path is explicitly locked
+        if self.explicitly_locked_paths.contains(&path.to_path_buf()) {
+            return true;
+        }
+        
+        // Now check parent paths from most specific to least specific
+        let mut current = path;
+        while let Some(parent) = current.parent() {
+            // Check if any parent is explicitly unlocked
+            if self.explicitly_unlocked_paths.iter().any(|p| p == parent) {
+                return false;
+            }
+            
+            // Check if any parent is explicitly locked
+            if self.explicitly_locked_paths.iter().any(|p| p == parent) {
+                // Before returning true, check if there's an unlock between this parent and our path
+                let locked_parent = parent;
+                for unlock_path in &self.explicitly_unlocked_paths {
+                    // If unlock_path is between locked_parent and path
+                    if path.starts_with(unlock_path) && unlock_path.starts_with(locked_parent) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            
+            current = parent;
+        }
+        
+        // No explicit lock or unlock found in the hierarchy
+        false
+    }
+    
+    fn has_locked_ancestor(&self, path: &std::path::Path) -> bool {
+        // Check if any ancestor is locked (excluding the path itself)
+        let mut current = path;
+        while let Some(parent) = current.parent() {
+            if self.explicitly_locked_paths.iter().any(|p| p == parent) {
+                // Check if there's an unlock between this parent and our path
+                for unlock_path in &self.explicitly_unlocked_paths {
+                    if path.starts_with(unlock_path) && unlock_path.starts_with(parent) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            current = parent;
+        }
+        false
+    }
+    
+    fn has_unlocked_ancestor(&self, path: &std::path::Path) -> bool {
+        for unlocked_path in &self.explicitly_unlocked_paths {
+            if unlocked_path != path && path.starts_with(unlocked_path) {
+                return true;
+            }
+        }
+        false
+    }
+    
+    pub fn cleanup_lock_lists(&mut self) {
+        // Remove duplicates
+        let mut seen_locked = HashSet::new();
+        self.explicitly_locked_paths.retain(|path| seen_locked.insert(path.clone()));
+        
+        let mut seen_unlocked = HashSet::new();
+        self.explicitly_unlocked_paths.retain(|path| seen_unlocked.insert(path.clone()));
+        
+        // Remove any paths that are in both lists (unlocked takes precedence)
+        let unlocked_set: HashSet<_> = self.explicitly_unlocked_paths.iter().cloned().collect();
+        self.explicitly_locked_paths.retain(|path| !unlocked_set.contains(path));
+        
+        // Remove redundant unlocks (unlocks without a parent lock)
+        let locked_paths = self.explicitly_locked_paths.clone();
+        self.explicitly_unlocked_paths.retain(|unlock_path| {
+            // Check if this unlock path has a locked ancestor
+            for locked_path in &locked_paths {
+                if locked_path != unlock_path && unlock_path.starts_with(locked_path) {
+                    return true;  // Keep this unlock
+                }
+            }
+            false  // Remove this unlock (no locked ancestor)
+        });
     }
 
     pub fn toggle_expand_selected(&mut self) {
@@ -155,7 +342,65 @@ impl App {
     fn save_state(&self) {
         let mut state = crate::state::AppState::new(self.root_path.clone());
         state.update_expanded_dirs(self.get_expanded_dirs());
-        state.update_from_tree(&self.tree);
+        
+        // Convert explicit paths to patterns with deduplication
+        let mut locked_patterns = std::collections::HashSet::new();
+        for path in &self.explicitly_locked_paths {
+            if let Ok(relative) = path.strip_prefix(&self.root_path) {
+                if relative.as_os_str().is_empty() {
+                    locked_patterns.insert("**".to_string());
+                } else {
+                    let pattern = if path.is_dir() {
+                        format!("{}/**", relative.display())
+                    } else {
+                        relative.display().to_string()
+                    };
+                    locked_patterns.insert(pattern);
+                }
+            }
+        }
+        
+        // Save explicitly unlocked patterns with deduplication
+        let mut unlocked_patterns = std::collections::HashSet::new();
+        for path in &self.explicitly_unlocked_paths {
+            if let Ok(relative) = path.strip_prefix(&self.root_path) {
+                let pattern = if path.is_dir() {
+                    format!("{}/**", relative.display())
+                } else {
+                    relative.display().to_string()
+                };
+                unlocked_patterns.insert(pattern);
+            }
+        }
+        
+        // Remove any patterns that appear in both locked and unlocked
+        // (unlocked takes precedence)
+        for pattern in &unlocked_patterns {
+            locked_patterns.remove(pattern);
+        }
+        
+        // Convert to vectors
+        let mut locked_vec: Vec<String> = locked_patterns.into_iter().collect();
+        let mut unlocked_vec: Vec<String> = unlocked_patterns.into_iter().collect();
+        
+        // Optimize patterns - remove redundant ones
+        // For locked patterns, we need to consider unlocked patterns too
+        locked_vec = optimize_patterns_with_context(locked_vec, &unlocked_vec);
+        unlocked_vec = optimize_patterns(unlocked_vec);
+        
+        // Sort for consistent output
+        locked_vec.sort();
+        unlocked_vec.sort();
+        
+        state.locked_patterns = locked_vec.clone();
+        state.unlocked_patterns = unlocked_vec.clone();
+        
+        if std::env::var("ICAROS_DEBUG").is_ok() {
+            eprintln!("Saving patterns:");
+            eprintln!("  Locked: {:?}", locked_vec);
+            eprintln!("  Unlocked: {:?}", unlocked_vec);
+        }
+        
         if let Err(e) = state.save_to_file(&self.state_file) {
             eprintln!("Error saving state: {}", e);
         }
@@ -176,7 +421,12 @@ impl App {
     }
 
     pub fn get_locked_files(&self) -> Vec<std::path::PathBuf> {
-        self.tree.get_locked_files()
+        // Return only explicitly locked paths, not inherited ones
+        self.explicitly_locked_paths.clone()
+    }
+    
+    pub fn get_unlocked_files(&self) -> Vec<std::path::PathBuf> {
+        self.explicitly_unlocked_paths.clone()
     }
 
     pub fn get_expanded_dirs(&self) -> Vec<std::path::PathBuf> {
@@ -184,6 +434,102 @@ impl App {
         self.collect_expanded_dirs(&self.tree, &mut expanded);
         expanded
     }
+    
+    pub fn refresh_tree(&mut self) -> Result<()> {
+        // Save current state
+        let expanded_dirs = self.get_expanded_dirs();
+        let current_selected_path = if self.selected < self.items.len() {
+            Some(self.items[self.selected].0.path.clone())
+        } else {
+            None
+        };
+        
+        // Rebuild tree with hidden file filter
+        self.tree = crate::file_tree::build_tree(&self.root_path, &[], self.show_hidden)?;
+        
+        // Reapply all explicit locks
+        self.reapply_explicit_locks();
+        
+        // Restore expanded state
+        for expanded_path in &expanded_dirs {
+            restore_expanded_state(&mut self.tree, expanded_path);
+        }
+        
+        // Update items
+        self.update_items();
+        
+        // Try to restore selection
+        if let Some(selected_path) = current_selected_path {
+            for (i, (node, _)) in self.items.iter().enumerate() {
+                if node.path == selected_path {
+                    self.selected = i;
+                    self.list_state.select(Some(i));
+                    break;
+                }
+            }
+        }
+        
+        self.save_state();
+        self.needs_refresh = false;
+        self.last_refresh = Instant::now();
+        Ok(())
+    }
+    
+    pub fn reapply_explicit_locks(&mut self) {
+        // First, unlock everything
+        unlock_all_recursive(&mut self.tree);
+        
+        // Sort paths by depth (parent paths first)
+        let mut sorted_locked = self.explicitly_locked_paths.clone();
+        sorted_locked.sort_by_key(|p| p.components().count());
+        
+        let mut sorted_unlocked = self.explicitly_unlocked_paths.clone();
+        sorted_unlocked.sort_by_key(|p| p.components().count());
+        
+        // Apply locks and unlocks in order of depth
+        let mut all_paths: Vec<(std::path::PathBuf, bool)> = Vec::new();
+        for path in sorted_locked {
+            all_paths.push((path, true)); // true = lock
+        }
+        for path in sorted_unlocked {
+            all_paths.push((path, false)); // false = unlock
+        }
+        
+        // Sort by depth, then by lock/unlock (locks before unlocks at same depth)
+        all_paths.sort_by(|a, b| {
+            let depth_a = a.0.components().count();
+            let depth_b = b.0.components().count();
+            match depth_a.cmp(&depth_b) {
+                std::cmp::Ordering::Equal => {
+                    // At same depth, apply unlocks first, then locks
+                    // This ensures specific locks can override general unlocks
+                    b.1.cmp(&a.1)
+                }
+                other => other
+            }
+        });
+        
+        // Apply in order
+        for (path, is_lock) in all_paths {
+            if is_lock {
+                lock_path_and_children(&mut self.tree, &path);
+            } else {
+                // For unlocks, check if there are any explicit locks that should be preserved
+                let child_locks: Vec<_> = self.explicitly_locked_paths.iter()
+                    .filter(|p| p.starts_with(&path) && *p != &path)
+                    .cloned()
+                    .collect();
+                
+                unlock_path(&mut self.tree, &path);
+                
+                // Reapply any child locks that should be preserved
+                for child_lock in child_locks {
+                    lock_path_and_children(&mut self.tree, &child_lock);
+                }
+            }
+        }
+    }
+    
 
     fn collect_expanded_dirs(&self, node: &TreeNode, expanded: &mut Vec<std::path::PathBuf>) {
         if node.is_dir && node.is_expanded {
@@ -196,19 +542,6 @@ impl App {
     
 }
 
-fn toggle_node_at_path(node: &mut TreeNode, target_path: &std::path::Path) -> bool {
-    if node.path == target_path {
-        node.toggle_lock();
-        return true;
-    }
-    
-    for child in &mut node.children {
-        if toggle_node_at_path(child, target_path) {
-            return true;
-        }
-    }
-    false
-}
 
 fn toggle_expand_at_path(node: &mut TreeNode, target_path: &std::path::Path) -> bool {
     if node.path == target_path {
@@ -238,6 +571,166 @@ fn toggle_create_in_locked_at_path(node: &mut TreeNode, target_path: &std::path:
     false
 }
 
+fn unlock_all_recursive(node: &mut TreeNode) {
+    node.is_locked = false;
+    node.allow_create_in_locked = false;
+    for child in &mut node.children {
+        unlock_all_recursive(child);
+    }
+}
+
+fn lock_path_and_children(node: &mut TreeNode, path: &std::path::Path) {
+    if node.path == *path {
+        node.is_locked = true;
+        // Lock all children recursively
+        lock_all_children_recursive(node);
+        return;
+    }
+    
+    // If this node is an ancestor of the target path, keep searching
+    if path.starts_with(&node.path) {
+        for child in &mut node.children {
+            lock_path_and_children(child, path);
+        }
+    }
+}
+
+fn lock_all_children_recursive(node: &mut TreeNode) {
+    for child in &mut node.children {
+        child.is_locked = true;
+        child.allow_create_in_locked = false;
+        lock_all_children_recursive(child);
+    }
+}
+
+
+fn unlock_path(node: &mut TreeNode, path: &std::path::Path) {
+    if node.path == *path {
+        node.is_locked = false;
+        node.allow_create_in_locked = false;
+        // Also unlock all children recursively
+        unlock_all_recursive(node);
+        return;
+    }
+    
+    for child in &mut node.children {
+        unlock_path(child, path);
+    }
+}
+
+fn restore_expanded_state(node: &mut TreeNode, path: &std::path::Path) {
+    if node.path == *path {
+        node.is_expanded = true;
+    }
+    for child in &mut node.children {
+        restore_expanded_state(child, path);
+    }
+}
+
+fn optimize_patterns(patterns: Vec<String>) -> Vec<String> {
+    if patterns.is_empty() {
+        return patterns;
+    }
+    
+    let mut optimized: Vec<String> = Vec::new();
+    let mut sorted = patterns;
+    sorted.sort();
+    
+    for pattern in sorted {
+        let mut is_redundant = false;
+        
+        // Check if this pattern is covered by any existing pattern
+        for existing in &optimized {
+            if is_pattern_covered(&pattern, existing) {
+                is_redundant = true;
+                break;
+            }
+        }
+        
+        if !is_redundant {
+            // Remove any patterns that this one covers
+            optimized.retain(|existing| !is_pattern_covered(existing, &pattern));
+            optimized.push(pattern);
+        }
+    }
+    
+    optimized
+}
+
+fn optimize_patterns_with_context(locked_patterns: Vec<String>, unlocked_patterns: &[String]) -> Vec<String> {
+    if locked_patterns.is_empty() {
+        return locked_patterns;
+    }
+    
+    let mut optimized: Vec<String> = Vec::new();
+    let mut sorted = locked_patterns;
+    sorted.sort();
+    
+    for pattern in sorted {
+        let mut is_redundant = false;
+        
+        // Check if this pattern is covered by any existing pattern
+        for existing in &optimized {
+            if is_pattern_covered(&pattern, existing) {
+                // Before marking as redundant, check if this pattern is needed
+                // to override an unlocked pattern
+                let mut needed_for_override = false;
+                for unlocked in unlocked_patterns {
+                    if is_pattern_covered(&pattern, unlocked) {
+                        // This pattern is within an unlocked area, so we need it
+                        needed_for_override = true;
+                        break;
+                    }
+                }
+                
+                if !needed_for_override {
+                    is_redundant = true;
+                }
+                break;
+            }
+        }
+        
+        if !is_redundant {
+            // Remove any patterns that this one covers, unless they're needed for overrides
+            optimized.retain(|existing| {
+                if is_pattern_covered(existing, &pattern) {
+                    // Check if the existing pattern is needed to override an unlock
+                    for unlocked in unlocked_patterns {
+                        if is_pattern_covered(existing, unlocked) {
+                            return true; // Keep it
+                        }
+                    }
+                    return false; // Remove it
+                }
+                true // Keep patterns not covered by the new one
+            });
+            optimized.push(pattern);
+        }
+    }
+    
+    optimized
+}
+
+fn is_pattern_covered(specific: &str, general: &str) -> bool {
+    // Check if 'specific' is covered by 'general'
+    if general == "**" {
+        return true;
+    }
+    
+    if general.ends_with("/**") {
+        let general_prefix = &general[..general.len() - 3];
+        
+        // Check if specific is under this directory
+        if specific.starts_with(general_prefix) {
+            let remainder = &specific[general_prefix.len()..];
+            // It's covered if it's the exact directory or a child
+            return remainder.is_empty() || remainder.starts_with('/');
+        }
+    }
+    
+    false
+}
+
 pub fn run_ui(mut app: App) -> Result<App> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -245,7 +738,18 @@ pub fn run_ui(mut app: App) -> Result<App> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_app(&mut terminal, &mut app);
+    // Set up file watcher
+    let (tx, rx) = channel();
+    let mut watcher = notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
+        if let Ok(_event) = res {
+            let _ = tx.send(());
+        }
+    })?;
+    
+    // Watch the root path
+    watcher.watch(&app.root_path, RecursiveMode::Recursive)?;
+
+    let result = run_app(&mut terminal, &mut app, rx);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -298,9 +802,11 @@ fn get_native_pattern(frame: u64, offset: usize) -> &'static str {
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
+    fs_events: Receiver<()>,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
     let tick_rate = Duration::from_millis(50);
+    let debounce_duration = Duration::from_millis(500);
     
     loop {
         terminal.draw(|f| {
@@ -477,15 +983,19 @@ fn run_app<B: ratatui::backend::Backend>(
                 Line::from(vec![
                     Span::styled(format!(" {} ", left_pattern), Style::default().fg(pattern_color)),
                     Span::styled("↑↓", Style::default().fg(Color::Rgb(255, 105, 180)).add_modifier(Modifier::BOLD)),
-                    Span::raw(":navigate "),
+                    Span::raw(":nav "),
                     Span::styled("Space", Style::default().fg(Color::Rgb(0, 206, 209)).add_modifier(Modifier::BOLD)),
                     Span::raw(":lock "),
                     Span::styled("c", Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD)),
-                    Span::raw(":allow-create "),
+                    Span::raw(":create "),
                     Span::styled("Enter", Style::default().fg(Color::Rgb(138, 43, 226)).add_modifier(Modifier::BOLD)),
                     Span::raw(":expand "),
+                    Span::styled("h", Style::default().fg(Color::Rgb(255, 140, 0)).add_modifier(Modifier::BOLD)),
+                    Span::raw(format!(":{} ", if app.show_hidden { "hide" } else { "show" })),
                     Span::styled("a", Style::default().fg(Color::Rgb(64, 224, 208)).add_modifier(Modifier::BOLD)),
-                    Span::raw(":toggle-anim "),
+                    Span::raw(":anim "),
+                    Span::styled("r", Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD)),
+                    Span::raw(":refresh "),
                     Span::styled("q", Style::default().fg(Color::Rgb(255, 127, 80)).add_modifier(Modifier::BOLD)),
                     Span::raw(":quit"),
                     Span::styled(format!(" {} ", right_pattern), Style::default().fg(pattern_color)),
@@ -504,6 +1014,21 @@ fn run_app<B: ratatui::backend::Backend>(
             f.render_widget(help_widget, chunks[2]);
         })?;
 
+        // Check for file system events (non-blocking)
+        if fs_events.try_recv().is_ok() {
+            // Set flag to refresh, but debounce to avoid too many updates
+            if app.last_refresh.elapsed() > debounce_duration {
+                app.needs_refresh = true;
+            }
+        }
+        
+        // Refresh tree if needed
+        if app.needs_refresh && app.last_refresh.elapsed() > debounce_duration {
+            if let Err(e) = app.refresh_tree() {
+                eprintln!("Error refreshing tree: {}", e);
+            }
+        }
+        
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
@@ -518,6 +1043,11 @@ fn run_app<B: ratatui::backend::Backend>(
                 KeyCode::Enter => app.toggle_expand_selected(),
                 KeyCode::Char('c') => app.toggle_create_in_locked_selected(),
                 KeyCode::Char('a') => app.animations_enabled = !app.animations_enabled,
+                KeyCode::Char('r') => app.needs_refresh = true,  // Manual refresh
+                KeyCode::Char('h') => {
+                    app.show_hidden = !app.show_hidden;
+                    app.update_items();
+                },
                 _ => {}
             }
         }

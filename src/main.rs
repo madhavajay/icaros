@@ -44,7 +44,7 @@ fn main() -> Result<()> {
                 root_path.join(".icaros")
             });
             
-            let tree = file_tree::build_tree(&root_path, &args.ignore)?;
+            let tree = file_tree::build_tree(&root_path, &args.ignore, false)?;
             
             let mut app = ui::App::new(tree, state_file.clone(), root_path.clone());
             
@@ -74,24 +74,24 @@ fn restore_state(app: &mut ui::App, state: &state::AppState) {
         restore_expanded(&mut app.tree, expanded_dir);
     }
     
-    // Apply locked patterns
+    // Apply locked patterns and track explicitly locked paths
+    app.explicitly_locked_paths.clear();
     for pattern in &state.locked_patterns {
         if pattern == "**" {
             eprintln!("  Locking entire tree with pattern: {}", pattern);
-            // Lock entire tree recursively
-            lock_all_recursive(&mut app.tree);
+            app.explicitly_locked_paths.push(state.root_path.clone());
         } else if let Some(path) = pattern_to_path(&state.root_path, pattern) {
             eprintln!("  Locking path: {:?} from pattern: {}", path, pattern);
-            restore_locked(&mut app.tree, &path);
+            app.explicitly_locked_paths.push(path);
         }
     }
     
     // Then apply unlocked patterns (exceptions to locked patterns)
-    // This must come after locked patterns to override them
+    app.explicitly_unlocked_paths.clear();
     for pattern in &state.unlocked_patterns {
         if let Some(path) = pattern_to_path(&state.root_path, pattern) {
-            eprintln!("  Unlocking path: {:?} from pattern: {}", path, pattern);
-            restore_unlocked(&mut app.tree, &path);
+            eprintln!("  Explicit unlock path: {:?} from pattern: {}", path, pattern);
+            app.explicitly_unlocked_paths.push(path);
         }
     }
     
@@ -102,6 +102,12 @@ fn restore_state(app: &mut ui::App, state: &state::AppState) {
         }
     }
     
+    // Clean up any conflicts or duplicates
+    app.cleanup_lock_lists();
+    
+    // Apply the explicit locks to the tree
+    app.reapply_explicit_locks();
+    
     app.update_items();
     eprintln!("State restoration complete.");
 }
@@ -110,13 +116,17 @@ fn pattern_to_path(root: &std::path::Path, pattern: &str) -> Option<std::path::P
     if pattern == "**" {
         // Special case: root directory is locked
         Some(root.to_path_buf())
-    } else {
+    } else if pattern.ends_with("/**") {
+        // Directory pattern
         let clean_pattern = pattern.trim_end_matches("/**");
         if clean_pattern.is_empty() {
             Some(root.to_path_buf())
         } else {
             Some(root.join(clean_pattern))
         }
+    } else {
+        // File or specific path pattern
+        Some(root.join(pattern))
     }
 }
 
@@ -199,56 +209,9 @@ fn init_command(root_path: &Path) -> Result<()> {
     let claude_md_path = root_path.join("CLAUDE.md");
     let icaros_md_path = root_path.join("ICAROS.md");
     
-    // Create ICAROS.md content with lock system instructions
-    let icaros_content = r#"# ICAROS.md - File Lock System Guide
-
-> Icaros are sacred songs and chants used in Central and South American traditions to guide and protect people during spiritual journeys and vision quests.
-
-You are the Shaman-in-the-loop. Use Icaros to guide your Agentic People Spirits on their journey and keep them from 1-shotting themselves.
-
-## CRITICAL: File Lock System
-
-**BEFORE making ANY file modifications in this project:**
-
-1. **ALWAYS** read `.icaros` first
-2. Check the `locked_patterns` array
-3. Lock rules:
-   - If a file/directory matches a pattern in `locked_patterns` → REFUSE all operations (edit, delete, create)
-   - Exception: If directory is in `allow_create_patterns` → ALLOW creating new files only
-4. Default: Everything is unlocked unless explicitly in `locked_patterns`
-5. If locked, inform user that the file/directory is locked
-
-## Lock File Location
-- Primary: `.icaros` (in project root)
-- Alternative: Check `--state-file` argument if specified
-
-## Example Workflow
-```yaml
-Before any file operation:
-1. Read .icaros
-2. Parse locked_patterns array
-3. Check if target path matches any pattern:
-   - "src/**" matches src/main.rs, src/lib.rs, src/utils/helper.rs
-   - "README.md" matches only README.md
-4. If matched in locked_patterns:
-   - For create operation: Check allow_create_patterns
-   - For edit/delete: Always refuse
-5. If not matched → proceed with operation
-```
-
-## Pattern Matching
-- `**` wildcard matches any number of directories
-- `dir/**` locks entire directory tree
-- Specific files use exact paths relative to root
-- Compact representation: if entire dir is locked, just show `dir/**`
-
-## Remember
-- The lock file uses absolute paths
-- Lock state is saved immediately after changes
-- Locked directories lock all their children
-- This system helps users control which files AI can modify
-"#;
-
+    // Load templates from embedded files or from prompts directory
+    let icaros_content = load_template("ICAROS.md")?;
+    
     // Write ICAROS.md
     fs::write(&icaros_md_path, icaros_content)?;
     println!("Created ICAROS.md with file lock system instructions");
@@ -260,11 +223,17 @@ Before any file operation:
         
         // Check if it already references ICAROS.md
         if !claude_content.contains("ICAROS.md") {
-            // Add reference to ICAROS.md at the beginning
-            let updated_content = format!(
-                "# CLAUDE.md - Project-Specific Instructions for Claude\n\n## File Lock System\nSee [ICAROS.md](./ICAROS.md) for critical file lock system instructions.\n\n{}",
-                claude_content.trim_start_matches("# CLAUDE.md - Project-Specific Instructions for Claude").trim_start()
-            );
+            // Load update template
+            let update_template = load_template("CLAUDE_UPDATE.md")?;
+            
+            // Remove any existing CLAUDE.md header variations
+            let existing_content = claude_content
+                .trim_start_matches("# CLAUDE.md - Project-Specific Instructions for Claude")
+                .trim_start_matches("# CLAUDE.md - My Existing Instructions")
+                .trim_start_matches("# CLAUDE.md")
+                .trim_start();
+            
+            let updated_content = update_template.replace("{existing_content}", existing_content);
             fs::write(&claude_md_path, updated_content)?;
             println!("Updated CLAUDE.md to reference ICAROS.md");
         } else {
@@ -272,21 +241,38 @@ Before any file operation:
         }
     } else {
         // Create new CLAUDE.md
-        let claude_content = r#"# CLAUDE.md - Project-Specific Instructions for Claude
-
-## File Lock System
-See [ICAROS.md](./ICAROS.md) for critical file lock system instructions.
-
-## Project Description
-[Add your project-specific instructions here]
-
-## Important Reminders
-- Always check the file lock system before modifying files
-- Respect locked patterns to prevent unwanted modifications
-"#;
+        let claude_content = load_template("CLAUDE.md")?;
         fs::write(&claude_md_path, claude_content)?;
         println!("Created CLAUDE.md with reference to ICAROS.md");
     }
     
     Ok(())
+}
+
+fn load_template(filename: &str) -> Result<String> {
+    // First try to load from user's config directory
+    if let Some(config_dir) = dirs::config_dir() {
+        let user_template = config_dir.join("icaros").join("prompts").join(filename);
+        if user_template.exists() {
+            return fs::read_to_string(user_template)
+                .map_err(|e| anyhow::anyhow!("Failed to read user template: {}", e));
+        }
+    }
+    
+    // Then try from application's prompts directory
+    let app_template = PathBuf::from("prompts").join(filename);
+    if app_template.exists() {
+        return fs::read_to_string(app_template)
+            .map_err(|e| anyhow::anyhow!("Failed to read app template: {}", e));
+    }
+    
+    // Finally, use the embedded defaults
+    let content = match filename {
+        "ICAROS.md" => include_str!("../prompts/ICAROS.md"),
+        "CLAUDE.md" => include_str!("../prompts/CLAUDE.md"),
+        "CLAUDE_UPDATE.md" => include_str!("../prompts/CLAUDE_UPDATE.md"),
+        _ => return Err(anyhow::anyhow!("Unknown template: {}", filename)),
+    };
+    
+    Ok(content.to_string())
 }

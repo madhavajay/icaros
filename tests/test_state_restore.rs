@@ -17,7 +17,7 @@ fn test_restore_everything_locked_except_tests() {
     fs::write(root.join("README.md"), "# Test").unwrap();
     
     // Build the tree
-    let tree = file_tree::build_tree(root, &[]).unwrap();
+    let tree = file_tree::build_tree(root, &[], false).unwrap();
     
     // Create state file with everything locked except tests
     let state_file = root.join(".icaros");
