@@ -1,4 +1,5 @@
 use crate::file_tree::TreeNode;
+use crate::git::{GitManager, GitFile, GitHunk};
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -6,7 +7,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
@@ -37,6 +38,30 @@ pub struct App {
     pub explicitly_locked_paths: Vec<std::path::PathBuf>,
     pub explicitly_unlocked_paths: Vec<std::path::PathBuf>,
     pub show_hidden: bool,
+    // Tab support
+    pub active_tab: TabIndex,
+    // Git support
+    pub git_manager: Option<GitManager>,
+    pub git_files: Vec<GitFile>,
+    pub git_file_list_state: ListState,
+    pub git_selected_file: usize,
+    pub git_diff_hunks: Vec<GitHunk>,
+    pub git_diff_scroll: u16,
+    pub git_selected_hunk: usize,
+    pub git_pane: GitPane,
+    pub show_help: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TabIndex {
+    FileGuardian,
+    GitStage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GitPane {
+    FileList,
+    DiffView,
 }
 
 
@@ -81,6 +106,14 @@ const SUNSET_GRADIENT: &[Color] = &[
 
 impl App {
     pub fn new(tree: TreeNode, state_file: std::path::PathBuf, root_path: std::path::PathBuf) -> Self {
+        // Try to initialize Git manager
+        let git_manager = GitManager::new(&root_path).ok();
+        let git_files = if let Some(ref git) = git_manager {
+            git.get_status_files().unwrap_or_else(|_| Vec::new())
+        } else {
+            Vec::new()
+        };
+        
         let mut app = Self {
             tree,
             list_state: ListState::default(),
@@ -99,9 +132,22 @@ impl App {
             explicitly_locked_paths: Vec::new(),
             explicitly_unlocked_paths: Vec::new(),
             show_hidden: false,
+            active_tab: TabIndex::FileGuardian,
+            git_manager,
+            git_files,
+            git_file_list_state: ListState::default(),
+            git_selected_file: 0,
+            git_diff_hunks: Vec::new(),
+            git_diff_scroll: 0,
+            git_selected_hunk: 0,
+            git_pane: GitPane::FileList,
+            show_help: false,
         };
         app.update_items();
         app.list_state.select(Some(0));
+        if !app.git_files.is_empty() {
+            app.git_file_list_state.select(Some(0));
+        }
         app
     }
 
@@ -540,6 +586,90 @@ impl App {
         }
     }
     
+    // Git-related methods
+    pub fn refresh_git_status(&mut self) {
+        if let Some(ref git) = self.git_manager {
+            if let Ok(files) = git.get_status_files() {
+                self.git_files = files;
+                // Reset selection if list is not empty
+                if !self.git_files.is_empty() && self.git_selected_file >= self.git_files.len() {
+                    self.git_selected_file = 0;
+                    self.git_file_list_state.select(Some(0));
+                }
+            }
+        }
+    }
+    
+    pub fn load_git_diff(&mut self) {
+        if let Some(ref git) = self.git_manager {
+            if self.git_selected_file < self.git_files.len() {
+                let file = &self.git_files[self.git_selected_file];
+                if let Ok(hunks) = git.get_file_diff(&file.path, file.staged) {
+                    self.git_diff_hunks = hunks;
+                    self.git_diff_scroll = 0;
+                    self.git_selected_hunk = 0;
+                }
+            }
+        }
+    }
+    
+    pub fn toggle_git_file_stage(&mut self) {
+        if let Some(ref git) = self.git_manager {
+            if self.git_selected_file < self.git_files.len() {
+                let file = &self.git_files[self.git_selected_file];
+                let result = if file.staged {
+                    git.unstage_file(&file.path)
+                } else {
+                    git.stage_file(&file.path)
+                };
+                
+                if result.is_ok() {
+                    self.refresh_git_status();
+                    self.load_git_diff();
+                }
+            }
+        }
+    }
+    
+    pub fn move_git_file_up(&mut self) {
+        if self.git_selected_file > 0 {
+            self.git_selected_file -= 1;
+            self.git_file_list_state.select(Some(self.git_selected_file));
+            self.load_git_diff();
+        }
+    }
+    
+    pub fn move_git_file_down(&mut self) {
+        if self.git_selected_file < self.git_files.len().saturating_sub(1) {
+            self.git_selected_file += 1;
+            self.git_file_list_state.select(Some(self.git_selected_file));
+            self.load_git_diff();
+        }
+    }
+    
+    pub fn move_git_hunk_up(&mut self) {
+        if self.git_selected_hunk > 0 {
+            self.git_selected_hunk -= 1;
+            // TODO: Adjust scroll to ensure hunk is visible
+        }
+    }
+    
+    pub fn move_git_hunk_down(&mut self) {
+        if self.git_selected_hunk < self.git_diff_hunks.len().saturating_sub(1) {
+            self.git_selected_hunk += 1;
+            // TODO: Adjust scroll to ensure hunk is visible
+        }
+    }
+    
+    pub fn scroll_git_diff_up(&mut self) {
+        self.git_diff_scroll = self.git_diff_scroll.saturating_sub(1);
+    }
+    
+    pub fn scroll_git_diff_down(&mut self) {
+        // TODO: Add max scroll based on content
+        self.git_diff_scroll += 1;
+    }
+    
 }
 
 
@@ -731,6 +861,170 @@ fn is_pattern_covered(specific: &str, general: &str) -> bool {
     false
 }
 
+fn render_file_guardian(
+    f: &mut ratatui::Frame,
+    app: &mut App,
+    area: Rect,
+) {
+    let items: Vec<ListItem> = app.items
+        .iter()
+        .map(|(node, indent)| {
+            let mut spans = vec![
+                Span::raw("  ".repeat(*indent)),
+            ];
+            
+            if node.is_dir {
+                spans.push(Span::raw(if node.is_expanded { "▼ " } else { "▶ " }));
+            } else {
+                spans.push(Span::raw("  "));
+            }
+            
+            if node.is_locked {
+                spans.push(Span::styled("🔒 ", 
+                    Style::default().fg(Color::Rgb(255, 107, 53))));
+                if node.is_dir && node.allow_create_in_locked {
+                    spans.push(Span::styled("➕ ", 
+                        Style::default().fg(Color::Rgb(0, 206, 209))));
+                } else {
+                    spans.push(Span::raw("   "));
+                }
+            } else {
+                spans.push(Span::raw("   "));
+                spans.push(Span::raw("   "));
+            }
+            
+            let style = if node.is_locked {
+                Style::default()
+                    .fg(Color::Rgb(255, 127, 80))  // Coral
+                    .add_modifier(Modifier::BOLD)
+            } else if node.is_dir {
+                Style::default()
+                    .fg(Color::Rgb(0, 206, 209))  // Static cyan for directories
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(Color::Rgb(255, 215, 0))  // Gold
+            };
+            
+            spans.push(Span::styled(&node.name, style));
+            
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Rgb(138, 43, 226)))  // Static violet
+            .title(" 🦙 File Guardian 🦙 ")
+            .style(Style::default().bg(Color::Rgb(0, 0, 0))))
+        .highlight_style(Style::default()
+            .bg(Color::Rgb(138, 43, 226))
+            .add_modifier(Modifier::BOLD));
+
+    f.render_stateful_widget(list, area, &mut app.list_state);
+}
+
+fn render_git_stage(
+    f: &mut ratatui::Frame,
+    app: &mut App,
+    area: Rect,
+) {
+    // Split the area into two panes
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(40), // File list
+            Constraint::Percentage(60), // Diff view
+        ].as_ref())
+        .split(area);
+    
+    // Render file list
+    let file_items: Vec<ListItem> = app.git_files
+        .iter()
+        .map(|file| {
+            let status_color = file.status.color();
+            let status_str = file.status.to_str();
+            let staged_indicator = if file.staged { "●" } else { "○" };
+            
+            let spans = vec![
+                Span::styled(staged_indicator, Style::default().fg(if file.staged { Color::Green } else { Color::Gray })),
+                Span::raw(" "),
+                Span::styled(status_str, Style::default().fg(status_color)),
+                Span::raw(" "),
+                Span::styled(file.path.display().to_string(), Style::default().fg(Color::White)),
+            ];
+            
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    
+    let file_list = List::new(file_items)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if app.git_pane == GitPane::FileList {
+                Color::Yellow
+            } else {
+                Color::Gray
+            }))
+            .title(" Changed Files ")
+            .style(Style::default().bg(Color::Rgb(0, 0, 0))))
+        .highlight_style(Style::default()
+            .bg(Color::Rgb(50, 50, 50))
+            .add_modifier(Modifier::BOLD));
+    
+    f.render_stateful_widget(file_list, chunks[0], &mut app.git_file_list_state);
+    
+    // Render diff view
+    let mut diff_lines = Vec::new();
+    let mut _current_line = 0;
+    
+    for (hunk_idx, hunk) in app.git_diff_hunks.iter().enumerate() {
+        // Add hunk header
+        let hunk_style = if hunk_idx == app.git_selected_hunk {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Blue)
+        };
+        diff_lines.push(Line::from(Span::styled(&hunk.header, hunk_style)));
+        _current_line += 1;
+        
+        // Add hunk lines
+        for line in &hunk.lines {
+            let (style, prefix) = match line.origin {
+                '+' => (Style::default().fg(Color::Green), "+"),
+                '-' => (Style::default().fg(Color::Red), "-"),
+                _ => (Style::default().fg(Color::Gray), " "),
+            };
+            
+            let content = format!("{}{}", prefix, line.content);
+            diff_lines.push(Line::from(Span::styled(content, style)));
+            _current_line += 1;
+        }
+        
+        // Add empty line between hunks
+        if hunk_idx < app.git_diff_hunks.len() - 1 {
+            diff_lines.push(Line::from(""));
+            _current_line += 1;
+        }
+    }
+    
+    let diff_widget = Paragraph::new(diff_lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if app.git_pane == GitPane::DiffView {
+                Color::Yellow
+            } else {
+                Color::Gray
+            }))
+            .title(" Diff ")
+            .style(Style::default().bg(Color::Rgb(0, 0, 0))))
+        .scroll((app.git_diff_scroll, 0));
+    
+    f.render_widget(diff_widget, chunks[1]);
+}
+
+
 pub fn run_ui(mut app: App) -> Result<App> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -819,9 +1113,8 @@ fn run_app<B: ratatui::backend::Backend>(
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(0),
-                    Constraint::Length(3),
+                    Constraint::Length(3),  // Top title bar
+                    Constraint::Min(0),     // Main content area
                 ].as_ref())
                 .split(f.size());
 
@@ -904,114 +1197,33 @@ fn run_app<B: ratatui::backend::Backend>(
             f.render_widget(title_widget, chunks[0]);
 
             // No more floating emojis in the main area
-
-            let items: Vec<ListItem> = app.items
-                .iter()
-                .map(|(node, indent)| {
-                    let mut spans = vec![
-                        Span::raw("  ".repeat(*indent)),
-                    ];
-                    
-                    if node.is_dir {
-                        spans.push(Span::raw(if node.is_expanded { "▼ " } else { "▶ " }));
-                    } else {
-                        spans.push(Span::raw("  "));
+            
+            // Check if help overlay should be shown
+            if app.show_help {
+                render_help_overlay(f, app, chunks[1]);
+            } else {
+                // Split main area for tabs
+                let main_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1), // Compact tab bar
+                        Constraint::Min(0),    // Content
+                    ].as_ref())
+                    .split(chunks[1]);
+                
+                // Render compact tabs
+                render_compact_tabs(f, app, main_chunks[0]);
+                
+                // Render content based on active tab
+                match app.active_tab {
+                    TabIndex::FileGuardian => {
+                        render_file_guardian(f, app, main_chunks[1]);
                     }
-                    
-                    if node.is_locked {
-                        spans.push(Span::styled("🔒 ", 
-                            Style::default().fg(Color::Rgb(255, 107, 53))));
-                        if node.is_dir && node.allow_create_in_locked {
-                            spans.push(Span::styled("➕ ", 
-                                Style::default().fg(Color::Rgb(0, 206, 209))));
-                        } else {
-                            spans.push(Span::raw("   "));
-                        }
-                    } else {
-                        spans.push(Span::raw("   "));
-                        spans.push(Span::raw("   "));
+                    TabIndex::GitStage => {
+                        render_git_stage(f, app, main_chunks[1]);
                     }
-                    
-                    let style = if node.is_locked {
-                        Style::default()
-                            .fg(Color::Rgb(255, 127, 80))  // Coral
-                            .add_modifier(Modifier::BOLD)
-                    } else if node.is_dir {
-                        Style::default()
-                            .fg(Color::Rgb(0, 206, 209))  // Static cyan for directories
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                            .fg(Color::Rgb(255, 215, 0))  // Gold
-                    };
-                    
-                    spans.push(Span::styled(&node.name, style));
-                    
-                    ListItem::new(Line::from(spans))
-                })
-                .collect();
-
-            let list = List::new(items)
-                .block(Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Rgb(138, 43, 226)))  // Static violet
-                    .title(" 🦙 File Guardian 🦙 ")  // Static title
-                    .style(Style::default().bg(Color::Rgb(0, 0, 0))))
-                .highlight_style(Style::default()
-                    .bg(Color::Rgb(138, 43, 226))
-                    .add_modifier(Modifier::BOLD));
-
-            f.render_stateful_widget(list, chunks[1], &mut app.list_state);
-
-            // Render bottom help bar
-            let left_pattern = if app.animations_enabled {
-                get_native_pattern(app.frame_count, 0)
-            } else {
-                "◇"
-            };
-            let right_pattern = if app.animations_enabled {
-                get_native_pattern(app.frame_count, 1)
-            } else {
-                "◈"
-            };
-            let pattern_color = if app.animations_enabled {
-                get_gradient_color(0.5, app.wave_offset, EARTH_COLORS)
-            } else {
-                Color::Rgb(160, 82, 45)  // Static sienna
-            };
-            let help_text = vec![
-                Line::from(vec![
-                    Span::styled(format!(" {} ", left_pattern), Style::default().fg(pattern_color)),
-                    Span::styled("↑↓", Style::default().fg(Color::Rgb(255, 105, 180)).add_modifier(Modifier::BOLD)),
-                    Span::raw(":nav "),
-                    Span::styled("Space", Style::default().fg(Color::Rgb(0, 206, 209)).add_modifier(Modifier::BOLD)),
-                    Span::raw(":lock "),
-                    Span::styled("c", Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD)),
-                    Span::raw(":create "),
-                    Span::styled("Enter", Style::default().fg(Color::Rgb(138, 43, 226)).add_modifier(Modifier::BOLD)),
-                    Span::raw(":expand "),
-                    Span::styled("h", Style::default().fg(Color::Rgb(255, 140, 0)).add_modifier(Modifier::BOLD)),
-                    Span::raw(format!(":{} ", if app.show_hidden { "hide" } else { "show" })),
-                    Span::styled("a", Style::default().fg(Color::Rgb(64, 224, 208)).add_modifier(Modifier::BOLD)),
-                    Span::raw(":anim "),
-                    Span::styled("r", Style::default().fg(Color::Rgb(255, 215, 0)).add_modifier(Modifier::BOLD)),
-                    Span::raw(":refresh "),
-                    Span::styled("q", Style::default().fg(Color::Rgb(255, 127, 80)).add_modifier(Modifier::BOLD)),
-                    Span::raw(":quit"),
-                    Span::styled(format!(" {} ", right_pattern), Style::default().fg(pattern_color)),
-                ]),
-            ];
-            let help_widget = Paragraph::new(help_text)
-                .block(Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(if app.animations_enabled {
-                        get_gradient_color(1.0, app.wave_offset * 2.0, EARTH_COLORS)
-                    } else {
-                        Color::Rgb(139, 69, 19)  // Static saddle brown
-                    }))
-                    .style(Style::default()))
-                .alignment(ratatui::layout::Alignment::Center);
-            f.render_widget(help_widget, chunks[2]);
+                }
+            }
         })?;
 
         // Check for file system events (non-blocking)
@@ -1035,22 +1247,115 @@ fn run_app<B: ratatui::backend::Backend>(
             
         if crossterm::event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
-            match key.code {
-                KeyCode::Char('q') => break,
-                KeyCode::Up => app.move_up(),
-                KeyCode::Down => app.move_down(),
-                KeyCode::Char(' ') => app.toggle_selected(),
-                KeyCode::Enter => app.toggle_expand_selected(),
-                KeyCode::Char('c') => app.toggle_create_in_locked_selected(),
-                KeyCode::Char('a') => app.animations_enabled = !app.animations_enabled,
-                KeyCode::Char('r') => app.needs_refresh = true,  // Manual refresh
-                KeyCode::Char('h') => {
-                    app.show_hidden = !app.show_hidden;
-                    app.update_items();
-                },
-                _ => {}
+                // Global keys
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('?') => app.show_help = !app.show_help,
+                    KeyCode::Tab => {
+                        app.active_tab = match app.active_tab {
+                            TabIndex::FileGuardian => {
+                                // Initialize Git view when switching to it
+                                app.refresh_git_status();
+                                if !app.git_files.is_empty() && app.git_selected_file < app.git_files.len() {
+                                    app.load_git_diff();
+                                }
+                                TabIndex::GitStage
+                            }
+                            TabIndex::GitStage => TabIndex::FileGuardian,
+                        };
+                    }
+                    KeyCode::BackTab => {
+                        app.active_tab = match app.active_tab {
+                            TabIndex::FileGuardian => {
+                                // Initialize Git view when switching to it
+                                app.refresh_git_status();
+                                if !app.git_files.is_empty() && app.git_selected_file < app.git_files.len() {
+                                    app.load_git_diff();
+                                }
+                                TabIndex::GitStage
+                            }
+                            TabIndex::GitStage => TabIndex::FileGuardian,
+                        };
+                    }
+                    _ => {
+                        // Tab-specific keys
+                        match app.active_tab {
+                            TabIndex::FileGuardian => {
+                                match key.code {
+                                    KeyCode::Up => app.move_up(),
+                                    KeyCode::Down => app.move_down(),
+                                    KeyCode::Char(' ') => app.toggle_selected(),
+                                    KeyCode::Enter => app.toggle_expand_selected(),
+                                    KeyCode::Char('c') => app.toggle_create_in_locked_selected(),
+                                    KeyCode::Char('a') => app.animations_enabled = !app.animations_enabled,
+                                    KeyCode::Char('r') => app.needs_refresh = true,
+                                    KeyCode::Char('h') => {
+                                        app.show_hidden = !app.show_hidden;
+                                        app.update_items();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            TabIndex::GitStage => {
+                                match key.code {
+                                    KeyCode::Left => app.git_pane = GitPane::FileList,
+                                    KeyCode::Right => {
+                                        if !app.git_files.is_empty() {
+                                            app.git_pane = GitPane::DiffView;
+                                        }
+                                    }
+                                    KeyCode::Up => {
+                                        match app.git_pane {
+                                            GitPane::FileList => app.move_git_file_up(),
+                                            GitPane::DiffView => app.scroll_git_diff_up(),
+                                        }
+                                    }
+                                    KeyCode::Down => {
+                                        match app.git_pane {
+                                            GitPane::FileList => app.move_git_file_down(),
+                                            GitPane::DiffView => app.scroll_git_diff_down(),
+                                        }
+                                    }
+                                    KeyCode::Char(' ') => {
+                                        if app.git_pane == GitPane::FileList {
+                                            app.toggle_git_file_stage();
+                                        }
+                                    }
+                                    KeyCode::Char('n') => {
+                                        if app.git_pane == GitPane::DiffView {
+                                            app.move_git_hunk_down();
+                                        }
+                                    }
+                                    KeyCode::Char('p') => {
+                                        if app.git_pane == GitPane::DiffView {
+                                            app.move_git_hunk_up();
+                                        }
+                                    }
+                                    KeyCode::Char('s') => {
+                                        // Stage current hunk (not implemented yet)
+                                        if app.git_pane == GitPane::DiffView && !app.git_diff_hunks.is_empty() {
+                                            // TODO: Implement hunk staging
+                                        }
+                                    }
+                                    KeyCode::Char('u') => {
+                                        // Unstage current hunk (not implemented yet)
+                                        if app.git_pane == GitPane::DiffView && !app.git_diff_hunks.is_empty() {
+                                            // TODO: Implement hunk unstaging
+                                        }
+                                    }
+                                    KeyCode::Char('r') => {
+                                        app.refresh_git_status();
+                                        if !app.git_files.is_empty() {
+                                            app.load_git_diff();
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
             }
-        }
         }
         
         if last_tick.elapsed() >= tick_rate {
@@ -1058,4 +1363,138 @@ fn run_app<B: ratatui::backend::Backend>(
         }
     }
     Ok(())
+}
+
+fn render_compact_tabs(
+    f: &mut ratatui::Frame,
+    app: &App,
+    area: Rect,
+) {
+    let tab_titles = match app.active_tab {
+        TabIndex::FileGuardian => " 🦙 File Guardian | Git Stage ",
+        TabIndex::GitStage => " File Guardian | 🔧 Git Stage ",
+    };
+    
+    let tab_line = Line::from(vec![
+        Span::styled("◈ I C A R O S ◈", Style::default()
+            .fg(Color::Rgb(255, 215, 0))
+            .add_modifier(Modifier::BOLD)),
+        Span::raw(" - "),
+        Span::styled(tab_titles, Style::default()
+            .fg(Color::Rgb(0, 206, 209))
+            .add_modifier(Modifier::BOLD)),
+        Span::styled(" [? for help]", Style::default().fg(Color::Gray)),
+    ]);
+    
+    let tab_widget = Paragraph::new(vec![tab_line])
+        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+    
+    f.render_widget(tab_widget, area);
+}
+
+fn render_help_overlay(
+    f: &mut ratatui::Frame,
+    app: &App,
+    area: Rect,
+) {
+    // Create a centered popup
+    let popup_area = centered_rect(80, 80, area);
+    
+    let help_content = match app.active_tab {
+        TabIndex::FileGuardian => vec![
+            Line::from(Span::styled("🦙 File Guardian Help", Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from("Navigation:"),
+            Line::from("  ↑↓        Navigate files"),
+            Line::from("  Tab       Switch to Git Stage"),
+            Line::from("  Enter     Expand/collapse directories"),
+            Line::from(""),
+            Line::from("Actions:"),
+            Line::from("  Space     Lock/unlock file or directory"),
+            Line::from("  c         Toggle 'allow create' in locked dirs"),
+            Line::from("  h         Show/hide hidden files"),
+            Line::from("  r         Refresh file tree"),
+            Line::from("  a         Toggle animations"),
+            Line::from(""),
+            Line::from("Visual Indicators:"),
+            Line::from("  🔒        Locked file/directory"),
+            Line::from("  🔒 ➕      Locked dir with create allowed"),
+            Line::from("  ▶▼        Collapsed/expanded directory"),
+            Line::from(""),
+            Line::from("Global:"),
+            Line::from("  ?         Toggle this help"),
+            Line::from("  q         Quit"),
+        ],
+        TabIndex::GitStage => vec![
+            Line::from(Span::styled("🔧 Git Stage Help", Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from("Navigation:"),
+            Line::from("  ←→        Switch between file list and diff"),
+            Line::from("  ↑↓        Navigate files or scroll diff"),
+            Line::from("  Tab       Switch to File Guardian"),
+            Line::from(""),
+            Line::from("File List Actions:"),
+            Line::from("  Space     Stage/unstage file"),
+            Line::from("  r         Refresh Git status"),
+            Line::from(""),
+            Line::from("Diff View Actions:"),
+            Line::from("  n/p       Next/previous hunk"),
+            Line::from("  s         Stage hunk (TODO)"),
+            Line::from("  u         Unstage hunk (TODO)"),
+            Line::from(""),
+            Line::from("File Status Indicators:"),
+            Line::from("  M         Modified file"),
+            Line::from("  A         Added (new) file"),
+            Line::from("  D         Deleted file"),
+            Line::from("  R         Renamed file"),
+            Line::from("  ??        Untracked file"),
+            Line::from("  ●○        Staged/unstaged indicator"),
+            Line::from(""),
+            Line::from("Global:"),
+            Line::from("  ?         Toggle this help"),
+            Line::from("  q         Quit"),
+        ],
+    };
+    
+    let help_widget = Paragraph::new(help_content)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(" Help - Press ? to close ")
+            .style(Style::default().bg(Color::Rgb(0, 0, 0))))
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    
+    // Clear the background
+    f.render_widget(
+        Block::default()
+            .style(Style::default().bg(Color::Rgb(0, 0, 0))),
+        popup_area
+    );
+    
+    f.render_widget(help_widget, popup_area);
+}
+
+// Helper function to create a centered rectangle
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
 }

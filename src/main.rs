@@ -1,6 +1,7 @@
 mod file_tree;
 mod state;
 mod ui;
+mod git;
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
