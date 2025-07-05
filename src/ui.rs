@@ -6,7 +6,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
@@ -25,35 +25,51 @@ pub struct App {
     pub root_path: std::path::PathBuf,
     pub frame_count: u64,
     pub _last_update: Instant,
-    pub floating_emojis: Vec<FloatingEmoji>,
+    pub animations_enabled: bool,
+    pub llama_x: f32,
+    pub day_night_cycle: f32,
+    pub wave_offset: f32,
 }
 
-#[derive(Clone)]
-pub struct FloatingEmoji {
-    emoji: &'static str,
-    x: f32,
-    y: f32,
-    dx: f32,
-    dy: f32,
-    color_index: usize,
-}
 
-const MYSTICAL_EMOJIS: &[&str] = &[
-    "🦙", "🌵", "🪶", "🎶", "🌀", "💫", "🍄", "🔥",
-    "🌙", "☀️", "🌿", "🧿", "✨", "👁️", "🧘", "🎨",
-    "🧭", "🐍", "⛰️", "🗿", "🪨", "🏺", "🌄"
+const NATIVE_PATTERNS: &[&str] = &[
+    "◇", "◈", "◊", "⟡", "✦", "✧", "◉", "◎", 
+    "▲", "▼", "◆", "♦", "⬟", "⬢", "⬣", "⬡"
 ];
 
-const PSYCHEDELIC_COLORS: &[Color] = &[
-    Color::Rgb(155, 89, 182),  // Purple
-    Color::Rgb(255, 107, 53),  // Orange
-    Color::Rgb(0, 206, 209),    // Cyan
-    Color::Rgb(255, 105, 180),  // Pink
-    Color::Rgb(255, 0, 255),    // Magenta
-    Color::Rgb(255, 215, 0),    // Gold
-    Color::Rgb(64, 224, 208),   // Turquoise
-    Color::Rgb(138, 43, 226),   // Violet
+const DESERT_ELEMENTS: &[&str] = &[
+    "🌵", "🏜️", "⛰️", "🪨", "🌄", "🌅"
 ];
+
+const TIME_ELEMENTS: &[(&str, &str)] = &[
+    ("☀️", "Dawn"),
+    ("🌞", "Day"),
+    ("🌅", "Dusk"),
+    ("🌙", "Night"),
+    ("⭐", "Midnight"),
+];
+
+const EARTH_COLORS: &[Color] = &[
+    Color::Rgb(184, 134, 11),   // Dark goldenrod
+    Color::Rgb(210, 105, 30),   // Chocolate
+    Color::Rgb(205, 133, 63),   // Peru
+    Color::Rgb(222, 184, 135),  // Burlywood
+    Color::Rgb(160, 82, 45),    // Sienna
+    Color::Rgb(139, 69, 19),    // Saddle brown
+    Color::Rgb(255, 140, 0),    // Dark orange
+    Color::Rgb(218, 165, 32),   // Goldenrod
+];
+
+const SUNSET_GRADIENT: &[Color] = &[
+    Color::Rgb(255, 94, 77),    // Sunset red
+    Color::Rgb(255, 140, 0),    // Dark orange
+    Color::Rgb(255, 206, 84),   // Sunset yellow
+    Color::Rgb(237, 117, 56),   // Sunset orange
+    Color::Rgb(95, 39, 205),    // Sunset purple
+    Color::Rgb(52, 31, 151),    // Deep purple
+    Color::Rgb(0, 0, 70),       // Night blue
+];
+
 
 impl App {
     pub fn new(tree: TreeNode, state_file: std::path::PathBuf, root_path: std::path::PathBuf) -> Self {
@@ -66,58 +82,31 @@ impl App {
             root_path,
             frame_count: 0,
             _last_update: Instant::now(),
-            floating_emojis: Self::init_floating_emojis(),
+            animations_enabled: true,
+            llama_x: 0.0,
+            day_night_cycle: 0.0,
+            wave_offset: 0.0,
         };
         app.update_items();
         app.list_state.select(Some(0));
         app
     }
 
-    fn init_floating_emojis() -> Vec<FloatingEmoji> {
-        vec![
-            FloatingEmoji { emoji: "🦙", x: 5.0, y: 2.0, dx: 0.5, dy: 0.3, color_index: 0 },
-            FloatingEmoji { emoji: "🌵", x: 20.0, y: 5.0, dx: -0.3, dy: 0.2, color_index: 1 },
-            FloatingEmoji { emoji: "🪶", x: 40.0, y: 3.0, dx: 0.4, dy: -0.3, color_index: 2 },
-            FloatingEmoji { emoji: "🌀", x: 60.0, y: 8.0, dx: -0.6, dy: 0.4, color_index: 3 },
-            FloatingEmoji { emoji: "✨", x: 30.0, y: 10.0, dx: 0.3, dy: -0.2, color_index: 4 },
-        ]
-    }
-
-    fn update_floating_emojis(&mut self, width: u16, height: u16) {
-        for emoji in &mut self.floating_emojis {
-            emoji.x += emoji.dx;
-            emoji.y += emoji.dy;
-
-            if emoji.x <= 0.0 || emoji.x >= width as f32 - 2.0 {
-                emoji.dx *= -1.0;
-            }
-            if emoji.y <= 0.0 || emoji.y >= height as f32 - 4.0 {
-                emoji.dy *= -1.0;
-            }
-
-            emoji.x = emoji.x.clamp(0.0, width as f32 - 2.0);
-            emoji.y = emoji.y.clamp(0.0, height as f32 - 4.0);
-            
-            emoji.color_index = (emoji.color_index + 1) % PSYCHEDELIC_COLORS.len();
+    fn update_animations(&mut self, width: u16) {
+        // Update llama position (slow wandering)
+        self.llama_x += 0.3;
+        if self.llama_x > width as f32 + 10.0 {
+            self.llama_x = -5.0;
         }
-
-        // Occasionally add new emoji
-        if self.frame_count % 60 == 0 && self.floating_emojis.len() < 10 {
-            let new_emoji = FloatingEmoji {
-                emoji: MYSTICAL_EMOJIS[self.frame_count as usize % MYSTICAL_EMOJIS.len()],
-                x: (self.frame_count % width as u64) as f32,
-                y: 2.0,
-                dx: 0.3,
-                dy: 0.2,
-                color_index: self.frame_count as usize % PSYCHEDELIC_COLORS.len(),
-            };
-            self.floating_emojis.push(new_emoji);
+        
+        // Update day/night cycle
+        self.day_night_cycle += 0.005;
+        if self.day_night_cycle > 1.0 {
+            self.day_night_cycle = 0.0;
         }
-
-        // Remove old emojis if too many
-        if self.floating_emojis.len() > 12 {
-            self.floating_emojis.remove(0);
-        }
+        
+        // Update wave offset for gradient effects
+        self.wave_offset += 0.1;
     }
 
     pub fn update_items(&mut self) {
@@ -266,14 +255,44 @@ pub fn run_ui(mut app: App) -> Result<App> {
     Ok(app)
 }
 
-fn get_psychedelic_color(frame: u64, index: usize) -> Color {
-    let color_index = ((frame / 10) as usize + index) % PSYCHEDELIC_COLORS.len();
-    PSYCHEDELIC_COLORS[color_index]
+fn get_gradient_color(position: f32, offset: f32, colors: &[Color]) -> Color {
+    let wave = ((position + offset).sin() + 1.0) / 2.0;
+    let index = (wave * (colors.len() - 1) as f32) as usize;
+    let next_index = (index + 1).min(colors.len() - 1);
+    let t = wave * (colors.len() - 1) as f32 - index as f32;
+    
+    interpolate_color(colors[index], colors[next_index], t)
 }
 
-fn get_shamanic_symbol(frame: u64) -> &'static str {
-    const SYMBOLS: &[&str] = &["◈", "◊", "✦", "✧", "⟡", "◉", "◎", "◇"];
-    SYMBOLS[(frame / 20) as usize % SYMBOLS.len()]
+fn interpolate_color(c1: Color, c2: Color, t: f32) -> Color {
+    match (c1, c2) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            Color::Rgb(
+                (r1 as f32 + (r2 as f32 - r1 as f32) * t) as u8,
+                (g1 as f32 + (g2 as f32 - g1 as f32) * t) as u8,
+                (b1 as f32 + (b2 as f32 - b1 as f32) * t) as u8,
+            )
+        },
+        _ => c1,
+    }
+}
+
+fn get_sky_color(day_night: f32) -> Color {
+    let index = (day_night * (SUNSET_GRADIENT.len() - 1) as f32) as usize;
+    let next_index = (index + 1).min(SUNSET_GRADIENT.len() - 1);
+    let t = day_night * (SUNSET_GRADIENT.len() - 1) as f32 - index as f32;
+    
+    interpolate_color(SUNSET_GRADIENT[index], SUNSET_GRADIENT[next_index], t)
+}
+
+fn get_time_emoji(day_night: f32) -> (&'static str, &'static str) {
+    let index = (day_night * TIME_ELEMENTS.len() as f32) as usize;
+    let index = index.min(TIME_ELEMENTS.len() - 1);
+    TIME_ELEMENTS[index]
+}
+
+fn get_native_pattern(frame: u64, offset: usize) -> &'static str {
+    NATIVE_PATTERNS[(frame / 15 + offset as u64) as usize % NATIVE_PATTERNS.len()]
 }
 
 fn run_app<B: ratatui::backend::Backend>(
@@ -286,8 +305,10 @@ fn run_app<B: ratatui::backend::Backend>(
     loop {
         terminal.draw(|f| {
             // Update animations
-            app.frame_count += 1;
-            app.update_floating_emojis(f.size().width, f.size().height);
+            if app.animations_enabled {
+                app.frame_count += 1;
+                app.update_animations(f.size().width);
+            }
             
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -298,52 +319,85 @@ fn run_app<B: ratatui::backend::Backend>(
                 ].as_ref())
                 .split(f.size());
 
-            // Render psychedelic title
-            let title_style = Style::default()
-                .fg(get_psychedelic_color(app.frame_count, 0))
-                .add_modifier(Modifier::BOLD);
-            let title = vec![
-                Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(get_shamanic_symbol(app.frame_count), title_style),
-                    Span::raw(" "),
-                    Span::styled("🦙 I C A R O S 🦙", title_style),
-                    Span::raw(" "),
-                    Span::styled(get_shamanic_symbol(app.frame_count + 1), title_style),
-                    Span::raw(" - "),
-                    Span::styled("Stop AI Agents from Going on Vision Quests", 
-                        Style::default().fg(get_psychedelic_color(app.frame_count, 3))),
-                    Span::raw(" "),
-                    Span::styled(get_shamanic_symbol(app.frame_count + 2), title_style),
-                ]),
-            ];
+            // Create animated title with gradient background
+            let mut title_spans = Vec::new();
+            let width = chunks[0].width as usize;
+            
+            if app.animations_enabled {
+                // Create gradient background
+                let sky_color = get_sky_color(app.day_night_cycle);
+                let (time_emoji, time_name) = get_time_emoji(app.day_night_cycle);
+                
+                // Build the title line with gradient effect
+                for i in 0..width {
+                    let x = i as f32 / width as f32;
+                    let gradient_color = get_gradient_color(x * 10.0, app.wave_offset, EARTH_COLORS);
+                    
+                    // Place llama
+                    if i as f32 >= app.llama_x && (i as f32) < app.llama_x + 2.0 {
+                        title_spans.push(Span::styled("🦙", Style::default().fg(Color::White).bg(sky_color)));
+                    }
+                    // Place desert elements
+                    else if i % 15 == 0 && i > 0 && i < width - 5 {
+                        let desert_elem = DESERT_ELEMENTS[(i / 15) % DESERT_ELEMENTS.len()];
+                        title_spans.push(Span::styled(desert_elem, Style::default().fg(gradient_color).bg(sky_color)));
+                    }
+                    // Place time emoji
+                    else if i == width - 10 {
+                        title_spans.push(Span::styled(time_emoji, Style::default().fg(Color::White).bg(sky_color)));
+                    }
+                    // Native patterns
+                    else if i % 8 == 0 {
+                        let pattern = get_native_pattern(app.frame_count, i);
+                        title_spans.push(Span::styled(pattern, Style::default().fg(gradient_color).bg(sky_color)));
+                    }
+                    else {
+                        title_spans.push(Span::styled(" ", Style::default().bg(sky_color)));
+                    }
+                }
+                
+                // Title text overlay
+                let title_text = "◈ I C A R O S ◈";
+                let title_start = (width / 2).saturating_sub(title_text.len() / 2);
+                for (i, ch) in title_text.chars().enumerate() {
+                    if title_start + i < title_spans.len() {
+                        let pulse = ((app.frame_count as f32 * 0.05 + i as f32 * 0.3).sin() + 1.0) / 2.0;
+                        let text_color = interpolate_color(
+                            Color::Rgb(255, 255, 255),
+                            Color::Rgb(255, 215, 0),
+                            pulse
+                        );
+                        title_spans[title_start + i] = Span::styled(
+                            ch.to_string(), 
+                            Style::default().fg(text_color).bg(sky_color).add_modifier(Modifier::BOLD)
+                        );
+                    }
+                }
+                
+                // Add subtitle
+                let subtitle = format!(" {} Journey ", time_name);
+                let _subtitle_start = (width / 2).saturating_sub(subtitle.len() / 2);
+                let _subtitle_y = 2; // This would need to be on a second line
+            } else {
+                // Static title
+                let static_line = format!("{:^width$}", "◈ I C A R O S ◈ - Stop AI Agents from Going on Vision Quests", width = width);
+                title_spans.push(Span::styled(static_line, Style::default().fg(Color::Rgb(255, 215, 0))));
+            }
+            
+            let title = vec![Line::from(title_spans)];
             let title_widget = Paragraph::new(title)
                 .block(Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(get_psychedelic_color(app.frame_count, 1)))
-                    .style(Style::default().bg(Color::Rgb(91, 44, 111))))  // Dark purple bg
+                    .border_style(Style::default().fg(if app.animations_enabled {
+                        get_gradient_color(0.0, app.wave_offset * 2.0, EARTH_COLORS)
+                    } else {
+                        Color::Rgb(210, 105, 30)  // Static chocolate
+                    }))
+                    .style(Style::default()))
                 .alignment(ratatui::layout::Alignment::Center);
             f.render_widget(title_widget, chunks[0]);
 
-            // Render floating emojis in the background
-            for emoji in &app.floating_emojis {
-                let x = emoji.x as u16;
-                let y = emoji.y as u16 + chunks[1].y;
-                if x < chunks[1].width && y < chunks[1].y + chunks[1].height {
-                    let emoji_style = Style::default()
-                        .fg(PSYCHEDELIC_COLORS[emoji.color_index])
-                        .add_modifier(Modifier::BOLD);
-                    let emoji_span = Span::styled(emoji.emoji, emoji_style);
-                    let emoji_widget = Paragraph::new(Line::from(vec![emoji_span]));
-                    let emoji_area = Rect {
-                        x: chunks[1].x + x,
-                        y,
-                        width: 2,
-                        height: 1,
-                    };
-                    f.render_widget(emoji_widget, emoji_area);
-                }
-            }
+            // No more floating emojis in the main area
 
             let items: Vec<ListItem> = app.items
                 .iter()
@@ -378,7 +432,7 @@ fn run_app<B: ratatui::backend::Backend>(
                             .add_modifier(Modifier::BOLD)
                     } else if node.is_dir {
                         Style::default()
-                            .fg(get_psychedelic_color(app.frame_count, *indent))
+                            .fg(Color::Rgb(0, 206, 209))  // Static cyan for directories
                             .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default()
@@ -394,11 +448,8 @@ fn run_app<B: ratatui::backend::Backend>(
             let list = List::new(items)
                 .block(Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(get_psychedelic_color(app.frame_count, 5)))
-                    .title(format!(" {} File Guardian {} ", 
-                        MYSTICAL_EMOJIS[(app.frame_count / 30) as usize % MYSTICAL_EMOJIS.len()],
-                        MYSTICAL_EMOJIS[(app.frame_count / 30 + 1) as usize % MYSTICAL_EMOJIS.len()]
-                    ))
+                    .border_style(Style::default().fg(Color::Rgb(138, 43, 226)))  // Static violet
+                    .title(" 🦙 File Guardian 🦙 ")  // Static title
                     .style(Style::default().bg(Color::Rgb(0, 0, 0))))
                 .highlight_style(Style::default()
                     .bg(Color::Rgb(138, 43, 226))
@@ -407,9 +458,24 @@ fn run_app<B: ratatui::backend::Backend>(
             f.render_stateful_widget(list, chunks[1], &mut app.list_state);
 
             // Render bottom help bar
+            let left_pattern = if app.animations_enabled {
+                get_native_pattern(app.frame_count, 0)
+            } else {
+                "◇"
+            };
+            let right_pattern = if app.animations_enabled {
+                get_native_pattern(app.frame_count, 1)
+            } else {
+                "◈"
+            };
+            let pattern_color = if app.animations_enabled {
+                get_gradient_color(0.5, app.wave_offset, EARTH_COLORS)
+            } else {
+                Color::Rgb(160, 82, 45)  // Static sienna
+            };
             let help_text = vec![
                 Line::from(vec![
-                    Span::styled(" 🌀 ", Style::default().fg(get_psychedelic_color(app.frame_count, 6))),
+                    Span::styled(format!(" {} ", left_pattern), Style::default().fg(pattern_color)),
                     Span::styled("↑↓", Style::default().fg(Color::Rgb(255, 105, 180)).add_modifier(Modifier::BOLD)),
                     Span::raw(":navigate "),
                     Span::styled("Space", Style::default().fg(Color::Rgb(0, 206, 209)).add_modifier(Modifier::BOLD)),
@@ -418,16 +484,22 @@ fn run_app<B: ratatui::backend::Backend>(
                     Span::raw(":allow-create "),
                     Span::styled("Enter", Style::default().fg(Color::Rgb(138, 43, 226)).add_modifier(Modifier::BOLD)),
                     Span::raw(":expand "),
+                    Span::styled("a", Style::default().fg(Color::Rgb(64, 224, 208)).add_modifier(Modifier::BOLD)),
+                    Span::raw(":toggle-anim "),
                     Span::styled("q", Style::default().fg(Color::Rgb(255, 127, 80)).add_modifier(Modifier::BOLD)),
                     Span::raw(":quit"),
-                    Span::styled(" 🌀", Style::default().fg(get_psychedelic_color(app.frame_count, 7))),
+                    Span::styled(format!(" {} ", right_pattern), Style::default().fg(pattern_color)),
                 ]),
             ];
             let help_widget = Paragraph::new(help_text)
                 .block(Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(get_psychedelic_color(app.frame_count, 2)))
-                    .style(Style::default().bg(Color::Rgb(91, 44, 111))))
+                    .border_style(Style::default().fg(if app.animations_enabled {
+                        get_gradient_color(1.0, app.wave_offset * 2.0, EARTH_COLORS)
+                    } else {
+                        Color::Rgb(139, 69, 19)  // Static saddle brown
+                    }))
+                    .style(Style::default()))
                 .alignment(ratatui::layout::Alignment::Center);
             f.render_widget(help_widget, chunks[2]);
         })?;
@@ -445,6 +517,7 @@ fn run_app<B: ratatui::backend::Backend>(
                 KeyCode::Char(' ') => app.toggle_selected(),
                 KeyCode::Enter => app.toggle_expand_selected(),
                 KeyCode::Char('c') => app.toggle_create_in_locked_selected(),
+                KeyCode::Char('a') => app.animations_enabled = !app.animations_enabled,
                 _ => {}
             }
         }
