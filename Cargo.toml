@@ -2,6 +2,19 @@
 name = "icaros"
 version = "0.1.0"
 edition = "2021"
+authors = ["Madhava Jay"]
+description = "A modern tmux session manager with an interactive TUI"
+repository = "https://github.com/madhavajay/icaros"
+homepage = "https://github.com/madhavajay/icaros"
+documentation = "https://github.com/madhavajay/icaros"
+readme = "README.md"
+license = "Apache-2.0"
+keywords = ["tmux", "terminal", "tui", "session-manager", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "icaros"
+path = "src/main.rs"
 
 [dependencies]
 crossterm = "0.27"
@@ -22,4 +35,6 @@ image = "0.25"
 ratatui-image = "2.0"
 
 [dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.0"
 tempfile = "3.8"
