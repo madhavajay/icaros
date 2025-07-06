@@ -1,0 +1,72 @@
+# ICAROS Ignore Patterns Template
+# Copy this section to your .icaros file under "ignore_patterns" to customize what files/directories are ignored
+
+# Default ignore patterns that are commonly ignored across most projects:
+# 
+# Version Control
+.git/
+.svn/
+.hg/
+
+# Build artifacts and dependencies
+target/          # Rust build directory
+node_modules/    # Node.js dependencies
+dist/            # Distribution/build output
+build/           # Generic build directory
+
+# IDE and editor files
+.idea/           # IntelliJ IDEA
+.vscode/         # Visual Studio Code
+*.swp            # Vim swap files
+*.swo            # Vim swap files
+*~               # Backup files
+
+# Python virtual environments and cache
+.venv/           # Python virtual environment
+venv/            # Python virtual environment (alternative name)
+__pycache__/     # Python bytecode cache
+.mypy_cache/     # MyPy type checker cache
+.pytest_cache/   # Pytest cache
+.tox/            # Tox testing cache
+*.pyc            # Python compiled files
+*.pyo            # Python optimized files
+
+# Environment and config files
+.env             # Environment variables
+.env.local       # Local environment variables
+.env.production  # Production environment variables
+.env.staging     # Staging environment variables
+
+# System files
+.DS_Store        # macOS Finder metadata
+Thumbs.db        # Windows image cache
+Desktop.ini      # Windows folder config
+
+# Log files and temporary files
+*.log            # Log files
+*.tmp            # Temporary files
+*.temp           # Temporary files
+*.cache          # Cache files
+
+# Package manager lock files (optional - some teams want to track these)
+# package-lock.json
+# yarn.lock
+# Cargo.lock
+
+# Example of how to add this to your .icaros file:
+# 
+# {
+#   "root_path": "/path/to/your/project",
+#   "ignore_patterns": [
+#     ".git/",
+#     "target/",
+#     "node_modules/",
+#     ".venv/",
+#     "__pycache__/",
+#     "*.log"
+#   ],
+#   "locked_patterns": [],
+#   "unlocked_patterns": ["**"],
+#   "allow_create_patterns": [],
+#   "expanded_dirs": []
+# }
