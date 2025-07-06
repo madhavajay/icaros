@@ -4,6 +4,28 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
 
+pub fn default_ignore_patterns() -> Vec<String> {
+    vec![
+        ".git/".to_string(),
+        "target/".to_string(),
+        "node_modules/".to_string(),
+        ".idea/".to_string(),
+        ".venv/".to_string(),
+        "venv/".to_string(),
+        "__pycache__/".to_string(),
+        ".mypy_cache/".to_string(),
+        ".pytest_cache/".to_string(),
+        ".tox/".to_string(),
+        "dist/".to_string(),
+        "build/".to_string(),
+        ".DS_Store".to_string(),
+        "*.log".to_string(),
+        "*.tmp".to_string(),
+        ".env".to_string(),
+        ".env.local".to_string(),
+    ]
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LockProfile {
     pub locked_patterns: Vec<String>,
@@ -33,6 +55,10 @@ pub struct AppState {
     
     #[serde(default)]
     pub expanded_dirs: Vec<PathBuf>,
+    
+    // File system ignore patterns
+    #[serde(default = "default_ignore_patterns")]
+    pub ignore_patterns: Vec<String>,
 }
 
 impl AppState {
@@ -45,6 +71,7 @@ impl AppState {
             unlocked_patterns: vec!["**".to_string()],
             allow_create_patterns: Vec::new(),
             expanded_dirs: Vec::new(),
+            ignore_patterns: default_ignore_patterns(),
         }
     }
 

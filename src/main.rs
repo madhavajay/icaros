@@ -28,6 +28,8 @@ struct Args {
 enum Commands {
     #[command(about = "Initialize CLAUDE.md and ICAROS.md files")]
     Init,
+    #[command(about = "Show current ignore patterns")]
+    ShowIgnore,
 }
 
 fn main() -> Result<()> {
@@ -40,12 +42,30 @@ fn main() -> Result<()> {
             init_command(&root_path)?;
             Ok(())
         }
+        Some(Commands::ShowIgnore) => {
+            show_ignore_command(&root_path, &args)?;
+            Ok(())
+        }
         None => {
             let state_file = args.state_file.unwrap_or_else(|| {
                 root_path.join(".icaros")
             });
             
-            let tree = file_tree::build_tree(&root_path, &args.ignore, false)?;
+            // Load ignore patterns from state file, or use defaults plus CLI args
+            let mut ignore_patterns = if state_file.exists() {
+                if let Ok(state) = state::AppState::load_from_file(&state_file) {
+                    state.ignore_patterns
+                } else {
+                    state::default_ignore_patterns()
+                }
+            } else {
+                state::default_ignore_patterns()
+            };
+            
+            // Add CLI ignore patterns
+            ignore_patterns.extend(args.ignore);
+            
+            let tree = file_tree::build_tree(&root_path, &ignore_patterns, false)?;
             
             let mut app = ui::App::new(tree, state_file.clone(), root_path.clone());
             
@@ -63,6 +83,51 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn show_ignore_command(root_path: &Path, args: &Args) -> Result<()> {
+    let default_state_file = root_path.join(".icaros");
+    let state_file = args.state_file.as_ref()
+        .unwrap_or(&default_state_file);
+    
+    println!("Ignore patterns for: {}", root_path.display());
+    println!();
+    
+    // Load patterns from state file or use defaults
+    let ignore_patterns = if state_file.exists() {
+        if let Ok(state) = state::AppState::load_from_file(state_file) {
+            println!("Source: .icaros file");
+            state.ignore_patterns
+        } else {
+            println!("Source: defaults (failed to read .icaros file)");
+            state::default_ignore_patterns()
+        }
+    } else {
+        println!("Source: defaults (no .icaros file found)");
+        state::default_ignore_patterns()
+    };
+    
+    // Add CLI patterns if any
+    let mut all_patterns = ignore_patterns;
+    if !args.ignore.is_empty() {
+        println!("CLI override patterns: {} additional patterns", args.ignore.len());
+        all_patterns.extend(args.ignore.clone());
+    }
+    
+    println!();
+    println!("Active ignore patterns ({} total):", all_patterns.len());
+    for (i, pattern) in all_patterns.iter().enumerate() {
+        println!("  {}: {}", i + 1, pattern);
+    }
+    
+    println!();
+    println!("Pattern types:");
+    println!("  Directories: {} (end with /)", all_patterns.iter().filter(|p| p.ends_with('/')).count());
+    println!("  Extensions:  {} (start with *.)", all_patterns.iter().filter(|p| p.starts_with("*.")).count());
+    println!("  Files:       {} (exact matches)", all_patterns.iter().filter(|p| !p.ends_with('/') && !p.starts_with("*.") && !p.contains('*')).count());
+    println!("  Patterns:    {} (contain wildcards)", all_patterns.iter().filter(|p| p.contains('*') && !p.starts_with("*.")).count());
+    
+    Ok(())
 }
 
 fn restore_state(app: &mut ui::App, state: &state::AppState) {

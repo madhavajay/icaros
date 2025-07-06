@@ -70,7 +70,7 @@ impl TreeNode {
     }
 }
 
-pub fn build_tree(root_path: &Path, ignore_patterns: &[String], show_hidden: bool) -> Result<TreeNode> {
+pub fn build_tree(root_path: &Path, custom_ignore_patterns: &[String], show_hidden: bool) -> Result<TreeNode> {
     let root_name = root_path.file_name()
         .unwrap_or_default()
         .to_string_lossy()
@@ -83,11 +83,19 @@ pub fn build_tree(root_path: &Path, ignore_patterns: &[String], show_hidden: boo
     for entry in WalkDir::new(root_path)
         .min_depth(1)
         .sort_by_file_name()
+        .follow_links(false)  // Don't follow symlinks to avoid issues
     {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                // Log the error but continue processing other files
+                eprintln!("Warning: Skipping entry due to IO error: {}", err);
+                continue;
+            }
+        };
         let path = entry.path();
         
-        if should_ignore(path, ignore_patterns, show_hidden) {
+        if should_ignore(path, custom_ignore_patterns, show_hidden) {
             continue;
         }
         
@@ -122,12 +130,6 @@ pub fn build_tree(root_path: &Path, ignore_patterns: &[String], show_hidden: boo
 fn should_ignore(path: &Path, patterns: &[String], show_hidden: bool) -> bool {
     let path_str = path.to_string_lossy();
     
-    // Always ignore these directories
-    if path_str.contains("/.git/") || path_str.contains("/target/") || 
-       path_str.contains("/node_modules/") || path_str.contains("/.idea/") {
-        return true;
-    }
-    
     // Check if it's a hidden file (starts with .)
     if !show_hidden {
         if let Some(file_name) = path.file_name() {
@@ -139,9 +141,41 @@ fn should_ignore(path: &Path, patterns: &[String], show_hidden: bool) -> bool {
         }
     }
     
+    // Check against ignore patterns
     for pattern in patterns {
-        if path_str.contains(pattern) {
-            return true;
+        if pattern.contains('*') {
+            // Simple glob pattern matching for * wildcards
+            if pattern.ends_with("*") {
+                let prefix = &pattern[..pattern.len() - 1];
+                if let Some(file_name) = path.file_name() {
+                    if file_name.to_string_lossy().starts_with(prefix) {
+                        return true;
+                    }
+                }
+            } else if pattern.starts_with("*.") {
+                let extension = &pattern[2..];
+                if let Some(ext) = path.extension() {
+                    if ext.to_string_lossy() == extension {
+                        return true;
+                    }
+                }
+            }
+        } else if pattern.ends_with('/') {
+            // Directory pattern - check if path contains this directory
+            if path_str.contains(&format!("/{}", pattern)) || path_str.contains(pattern) {
+                return true;
+            }
+        } else {
+            // Exact file name match
+            if let Some(file_name) = path.file_name() {
+                if file_name.to_string_lossy() == *pattern {
+                    return true;
+                }
+            }
+            // Also check if the pattern is contained in the path
+            if path_str.contains(pattern) {
+                return true;
+            }
         }
     }
     

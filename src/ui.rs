@@ -544,8 +544,15 @@ impl App {
             None
         };
         
-        // Rebuild tree with hidden file filter
-        self.tree = crate::file_tree::build_tree(&self.root_path, &[], self.show_hidden)?;
+        // Load ignore patterns from state or use defaults
+        let ignore_patterns = if let Ok(state) = crate::state::AppState::load_from_file(&self.state_file) {
+            state.ignore_patterns
+        } else {
+            crate::state::default_ignore_patterns()
+        };
+        
+        // Rebuild tree with ignore patterns and hidden file filter
+        self.tree = crate::file_tree::build_tree(&self.root_path, &ignore_patterns, self.show_hidden)?;
         
         // Reapply all explicit locks
         self.reapply_explicit_locks();
@@ -1617,11 +1624,36 @@ pub fn run_ui(mut app: App) -> Result<App> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
+    // Get ignore patterns for the file watcher
+    let watcher_ignore_patterns = if let Ok(state) = crate::state::AppState::load_from_file(&app.state_file) {
+        state.ignore_patterns
+    } else {
+        crate::state::default_ignore_patterns()
+    };
+
     // Set up file watcher
     let (tx, rx) = channel();
     let mut watcher = notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
-        if let Ok(_event) = res {
-            let _ = tx.send(());
+        if let Ok(event) = res {
+            // Filter out events from ignored directories
+            let should_process = event.paths.iter().any(|path| {
+                let path_str = path.to_string_lossy();
+                
+                // Check against ignore patterns
+                let ignored = watcher_ignore_patterns.iter().any(|pattern| {
+                    if pattern.ends_with('/') {
+                        path_str.contains(&format!("/{}", pattern)) || path_str.contains(pattern)
+                    } else {
+                        path_str.contains(pattern)
+                    }
+                });
+                
+                !ignored
+            });
+            
+            if should_process {
+                let _ = tx.send(());
+            }
         }
     })?;
     
@@ -1685,7 +1717,7 @@ fn run_app<B: ratatui::backend::Backend>(
 ) -> Result<()> {
     let mut last_tick = Instant::now();
     let tick_rate = Duration::from_millis(50);
-    let debounce_duration = Duration::from_millis(500);
+    let debounce_duration = Duration::from_millis(1500);  // Increased to handle rapid .venv changes
     
     loop {
         terminal.draw(|f| {
@@ -1829,8 +1861,16 @@ fn run_app<B: ratatui::backend::Backend>(
         
         // Refresh tree if needed
         if app.needs_refresh && app.last_refresh.elapsed() > debounce_duration {
-            if let Err(e) = app.refresh_tree() {
-                eprintln!("Error refreshing tree: {}", e);
+            match app.refresh_tree() {
+                Ok(_) => {
+                    // Refresh successful
+                }
+                Err(e) => {
+                    // More graceful error handling - just log and reset flag
+                    eprintln!("Warning: Tree refresh encountered issues: {}", e);
+                    app.needs_refresh = false;
+                    app.last_refresh = Instant::now();
+                }
             }
         }
         
