@@ -155,7 +155,10 @@ fn show_ignore_command(root_path: &Path, args: &Args) -> Result<()> {
 fn restore_state(app: &mut ui::App, state: &state::AppState) {
     eprintln!("Restoring state...");
     eprintln!("  locked_patterns: {}", state.locked_patterns.join(", "));
-    eprintln!("  unlocked_patterns: {}", state.unlocked_patterns.join(", "));
+    eprintln!(
+        "  unlocked_patterns: {}",
+        state.unlocked_patterns.join(", ")
+    );
 
     // First restore expanded dirs
     for expanded_dir in &state.expanded_dirs {
