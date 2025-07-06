@@ -1,5 +1,10 @@
 use crate::file_tree::TreeNode;
 use crate::git::{GitManager, GitFile, GitHunk};
+#[cfg(target_os = "macos")]
+use crate::fs_monitor;
+use std::fs::OpenOptions;
+use std::io::Write;
+use chrono::Utc;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -62,6 +67,17 @@ pub struct App {
     pub animation_state: AnimationState,
     pub animation_start: Option<Instant>,
     pub profile_switching: bool,
+    // File system monitoring
+    pub enable_monitoring: bool,
+    #[cfg(target_os = "macos")]
+    pub monitor: Option<fs_monitor::FsGuardianMonitor>,
+    #[cfg(target_os = "macos")]
+    pub monitor_events: Vec<fs_monitor::GuardianEvent>,
+    #[cfg(not(target_os = "macos"))]
+    pub monitor: Option<()>,
+    #[cfg(not(target_os = "macos"))]
+    pub monitor_events: Vec<String>,
+    pub show_monitor_notifications: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -137,8 +153,24 @@ const SUNSET_GRADIENT: &[Color] = &[
 ];
 
 
+fn log_to_file(message: &str) {
+    let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    let log_message = format!("[{}] {}\n", timestamp, message);
+    
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("logs/unified.log")
+    {
+        let _ = file.write_all(log_message.as_bytes());
+        let _ = file.flush();
+    }
+}
+
 impl App {
     pub fn new(tree: TreeNode, state_file: std::path::PathBuf, root_path: std::path::PathBuf) -> Self {
+        log_to_file(&format!("UI: Creating new App for root path: {:?}", root_path));
+        
         // Try to initialize Git manager
         let git_manager = GitManager::new(&root_path).ok();
         let git_files = if let Some(ref git) = git_manager {
@@ -185,6 +217,10 @@ impl App {
             animation_state: AnimationState::None,
             animation_start: None,
             profile_switching: false,
+            enable_monitoring: false,
+            monitor: None,
+            monitor_events: Vec::new(),
+            show_monitor_notifications: true,
         };
         app.update_items();
         app.list_state.select(Some(0));
@@ -533,6 +569,145 @@ impl App {
         let mut expanded = Vec::new();
         self.collect_expanded_dirs(&self.tree, &mut expanded);
         expanded
+    }
+    
+    pub fn toggle_monitoring(&mut self) {
+        log_to_file("UI: toggle_monitoring() called");
+        
+        #[cfg(target_os = "macos")]
+        {
+            if self.monitor.is_some() {
+                // Stop monitoring
+                log_to_file("UI: Stopping existing monitor");
+                if let Some(mut monitor) = self.monitor.take() {
+                    let _ = monitor.stop();
+                    self.monitor_events.push(fs_monitor::GuardianEvent::MonitorStopped);
+                    log_to_file("UI: Monitor stopped successfully");
+                }
+            } else {
+                log_to_file("UI: Starting new monitor");
+                
+                // Check if we're running with sudo
+                let uid = unsafe { libc::getuid() };
+                log_to_file(&format!("UI: Current UID: {}", uid));
+                
+                if uid != 0 {
+                    // Not running as root, show message
+                    log_to_file("UI: Not running as root, showing error");
+                    self.monitor_events.push(fs_monitor::GuardianEvent::MonitorError(
+                        "File monitoring requires sudo. Please restart icaros with: sudo cargo run".to_string()
+                    ));
+                    return;
+                }
+                
+                // Create and start monitor
+                log_to_file("UI: Creating monitor with default config");
+                let config = fs_monitor::MonitorConfig::default();
+                
+                match fs_monitor::FsGuardianMonitor::new(config, self.root_path.clone()) {
+                    Ok(mut monitor) => {
+                        log_to_file("UI: Monitor created successfully");
+                        
+                        // Update locked paths from state patterns
+                        let locked_paths = self.get_locked_paths_from_patterns();
+                        log_to_file(&format!("UI: Setting {} locked paths for monitoring", locked_paths.len()));
+                        for path in &locked_paths {
+                            log_to_file(&format!("  - {:?}", path));
+                        }
+                        let _ = monitor.update_locked_paths(locked_paths);
+                        
+                        // Start monitoring
+                        log_to_file(&format!("UI: Starting monitor for path: {:?}", self.root_path));
+                        if let Err(e) = monitor.start(&self.root_path) {
+                            log_to_file(&format!("UI: Failed to start monitor: {}", e));
+                            self.monitor_events.push(fs_monitor::GuardianEvent::MonitorError(
+                                format!("Failed to start monitor: {}", e)
+                            ));
+                        } else {
+                            log_to_file("UI: Monitor started successfully");
+                            self.monitor = Some(monitor);
+                            self.monitor_events.push(fs_monitor::GuardianEvent::MonitorStarted);
+                        }
+                    }
+                    Err(e) => {
+                        log_to_file(&format!("UI: Failed to create monitor: {}", e));
+                        self.monitor_events.push(fs_monitor::GuardianEvent::MonitorError(
+                            format!("Failed to create monitor: {}", e)
+                        ));
+                    }
+                }
+            }
+        }
+        
+        #[cfg(not(target_os = "macos"))]
+        {
+            log_to_file("UI: Not on macOS, monitoring not available");
+            self.monitor_events.push("File monitoring is only available on macOS".to_string());
+        }
+    }
+    
+    fn get_all_locked_paths(&self) -> Vec<std::path::PathBuf> {
+        let mut locked = Vec::new();
+        self.collect_locked_paths(&self.tree, &mut locked);
+        log_to_file(&format!("DEBUG get_all_locked_paths: Found {} locked paths from tree", locked.len()));
+        for path in &locked {
+            log_to_file(&format!("  - Tree locked path: {:?}", path));
+        }
+        locked
+    }
+
+    fn get_locked_paths_from_patterns(&self) -> Vec<std::path::PathBuf> {
+        // Read state file to get patterns
+        if let Ok(state) = crate::state::AppState::load_from_file(&self.state_file) {
+            log_to_file(&format!("DEBUG: Loaded state with {} locked patterns", state.locked_patterns.len()));
+            let mut paths = Vec::new();
+            
+            // Convert patterns to actual paths
+            for pattern in &state.locked_patterns {
+                log_to_file(&format!("DEBUG: Processing pattern: {}", pattern));
+                
+                // Remove /** from end if present and convert to absolute path
+                let clean_pattern = pattern.trim_end_matches("/**").trim_end_matches("/*");
+                let abs_path = self.root_path.join(clean_pattern);
+                
+                if abs_path.exists() {
+                    paths.push(abs_path.clone());
+                    log_to_file(&format!("DEBUG: Added path: {:?}", abs_path));
+                } else {
+                    log_to_file(&format!("DEBUG: Path does not exist: {:?}", abs_path));
+                }
+            }
+            
+            paths
+        } else {
+            log_to_file("DEBUG: Failed to load state file");
+            Vec::new()
+        }
+    }
+    
+    fn collect_locked_paths(&self, node: &TreeNode, locked: &mut Vec<std::path::PathBuf>) {
+        if node.is_locked {
+            locked.push(node.path.clone());
+        }
+        for child in &node.children {
+            self.collect_locked_paths(child, locked);
+        }
+    }
+    
+    pub fn check_monitor_events(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(ref monitor) = self.monitor {
+                // Check for new events
+                while let Ok(event) = monitor.events().try_recv() {
+                    self.monitor_events.push(event);
+                    // Keep only last 10 events
+                    if self.monitor_events.len() > 10 {
+                        self.monitor_events.remove(0);
+                    }
+                }
+            }
+        }
     }
     
     pub fn refresh_tree(&mut self) -> Result<()> {
@@ -1194,11 +1369,18 @@ fn render_file_guardian(
         })
         .collect();
 
+    // Add monitor status to title
+    let title = if app.monitor.is_some() {
+        " 🦙 File Guardian 🦙 [🛡️ Monitor Active] "
+    } else {
+        " 🦙 File Guardian 🦙 "
+    };
+    
     let list = List::new(items)
         .block(Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Rgb(138, 43, 226)))  // Static violet
-            .title(" 🦙 File Guardian 🦙 ")
+            .title(title)
             .style(Style::default().bg(Color::Rgb(0, 0, 0))))
         .highlight_style(Style::default()
             .bg(Color::Rgb(138, 43, 226))
@@ -1700,6 +1882,9 @@ fn run_app<B: ratatui::backend::Backend>(
                 app.update_profile_animation();
             }
             
+            // Check for monitor events
+            app.check_monitor_events();
+            
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -1816,6 +2001,11 @@ fn run_app<B: ratatui::backend::Backend>(
                         render_profiles(f, app, main_chunks[1]);
                     }
                 }
+                
+                // Render monitor notifications if any
+                if app.show_monitor_notifications && !app.monitor_events.is_empty() {
+                    render_monitor_notifications(f, app, chunks[1]);
+                }
             }
         })?;
 
@@ -1893,6 +2083,10 @@ fn run_app<B: ratatui::backend::Backend>(
                                     KeyCode::Char('h') => {
                                         app.show_hidden = !app.show_hidden;
                                         app.update_items();
+                                    }
+                                    KeyCode::Char('m') => {
+                                        log_to_file("UI: 'm' key pressed, calling toggle_monitoring");
+                                        app.toggle_monitoring();
                                     }
                                     _ => {}
                                 }
@@ -2032,6 +2226,83 @@ fn render_compact_tabs(
     f.render_widget(tab_widget, area);
 }
 
+fn render_monitor_notifications(
+    f: &mut ratatui::Frame,
+    app: &App,
+    area: Rect,
+) {
+    #[cfg(target_os = "macos")]
+    use fs_monitor::GuardianEvent;
+    
+    // Create a small notification area at the bottom
+    let notification_height = std::cmp::min(5, app.monitor_events.len() + 2) as u16;
+    let notification_area = Rect {
+        x: area.x + 2,
+        y: area.y + area.height.saturating_sub(notification_height + 2),
+        width: area.width.saturating_sub(4),
+        height: notification_height,
+    };
+    
+    let mut lines = vec![
+        Line::from(Span::styled("🛡️ Monitor Notifications", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+    ];
+    
+    // Show last few events
+    #[cfg(target_os = "macos")]
+    {
+        for event in app.monitor_events.iter().rev().take(3) {
+            let line = match event {
+                GuardianEvent::BlockedWrite { path, process, .. } => {
+                    Line::from(vec![
+                        Span::styled("🚫 Blocked: ", Style::default().fg(Color::Red)),
+                        Span::raw(format!("{} tried to write ", process)),
+                        Span::styled(path.file_name().unwrap_or_default().to_string_lossy().to_string(), Style::default().fg(Color::Cyan)),
+                    ])
+                }
+                GuardianEvent::BlockedDelete { path, process, .. } => {
+                    Line::from(vec![
+                        Span::styled("🗑️ Blocked: ", Style::default().fg(Color::Red)),
+                        Span::raw(format!("{} tried to delete ", process)),
+                        Span::styled(path.file_name().unwrap_or_default().to_string_lossy().to_string(), Style::default().fg(Color::Cyan)),
+                    ])
+                }
+                GuardianEvent::StashedChange { path, .. } => {
+                    Line::from(vec![
+                        Span::styled("📦 Stashed: ", Style::default().fg(Color::Green)),
+                        Span::styled(path.file_name().unwrap_or_default().to_string_lossy().to_string(), Style::default().fg(Color::Cyan)),
+                    ])
+                }
+                GuardianEvent::MonitorStarted => {
+                    Line::from(Span::styled("✅ Monitor started", Style::default().fg(Color::Green)))
+                }
+                GuardianEvent::MonitorStopped => {
+                    Line::from(Span::styled("⏹️ Monitor stopped", Style::default().fg(Color::Yellow)))
+                }
+                GuardianEvent::MonitorError(msg) => {
+                    Line::from(Span::styled(format!("❌ {}", msg), Style::default().fg(Color::Red)))
+                }
+                _ => continue,
+            };
+            lines.push(line);
+        }
+    }
+    
+    #[cfg(not(target_os = "macos"))]
+    {
+        for msg in app.monitor_events.iter().rev().take(3) {
+            lines.push(Line::from(Span::styled(msg.clone(), Style::default().fg(Color::Yellow))));
+        }
+    }
+    
+    let notification_widget = Paragraph::new(lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .style(Style::default().bg(Color::Rgb(20, 20, 20))));
+    
+    f.render_widget(notification_widget, notification_area);
+}
+
 fn render_help_overlay(
     f: &mut ratatui::Frame,
     app: &App,
@@ -2057,6 +2328,7 @@ fn render_help_overlay(
             Line::from("  h         Show/hide hidden files"),
             Line::from("  r         Refresh file tree"),
             Line::from("  a         Toggle animations"),
+            Line::from("  m         Toggle file monitoring (requires sudo)"),
             Line::from(""),
             Line::from("Visual Indicators:"),
             Line::from("  🔒        Locked file/directory"),

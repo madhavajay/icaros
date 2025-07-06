@@ -2,6 +2,10 @@ mod file_tree;
 mod state;
 mod ui;
 mod git;
+#[cfg(target_os = "macos")]
+mod fs_monitor;
+#[cfg(target_os = "macos")]
+mod stash;
 
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
