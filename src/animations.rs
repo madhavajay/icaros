@@ -20,6 +20,14 @@ pub struct Frame {
     pub file: Option<String>,
     #[serde(default)]
     pub image: Option<String>,
+    #[serde(default)]
+    pub overlay: bool,  // If true, this frame is an overlay on top of previous content
+    #[serde(default = "default_blink_rate")]
+    pub blink_rate_ms: u64,  // Blink rate in milliseconds, defaults to 200ms
+}
+
+fn default_blink_rate() -> u64 {
+    200
 }
 
 #[derive(Debug, Clone)]
@@ -92,14 +100,12 @@ impl AnimationEngine {
                 return None;
             }
             
-            // Find the current frame
+            // Find the current frame (skip overlay frames)
             let mut current_frame = None;
             for frame in &active.spell.frames {
-                if elapsed >= frame.frame {
+                if !frame.overlay && elapsed >= frame.frame {
                     current_frame = Some(frame);
                     log_debug!("ANIMATION: Using frame at {}ms", frame.frame);
-                } else {
-                    break;
                 }
             }
             
@@ -135,6 +141,50 @@ impl AnimationEngine {
             } else {
                 log_debug!("ANIMATION: No frame found for elapsed time {}ms", elapsed);
             }
+        }
+        None
+    }
+    
+    pub fn get_overlay_frame(&self) -> Option<String> {
+        if let Some(ref active) = self.active_animation {
+            let elapsed = active.start_time.elapsed().as_millis() as u64;
+            log_debug!("ANIMATION: get_overlay_frame called - elapsed: {}ms", elapsed);
+            
+            // Find current overlay frame if any
+            for frame in &active.spell.frames {
+                log_debug!("ANIMATION: Checking frame - overlay: {}, elapsed: {}ms, frame_time: {}ms", 
+                          frame.overlay, elapsed, frame.frame);
+                          
+                if frame.overlay && elapsed >= frame.frame {
+                    if let Some(ref text) = frame.text {
+                        // Simple reliable blinking: get current instant and use it for blink timing
+                        let now = std::time::Instant::now();
+                        let millis_since_epoch = now.duration_since(active.start_time).as_millis() as u64;
+                        
+                        let blink_cycle = millis_since_epoch / frame.blink_rate_ms;
+                        let show_text = blink_cycle % 2 == 0;
+                        
+                        log_debug!("ANIMATION: BLINK DEBUG - since_start: {}ms, cycle: {}, rate: {}ms, show: {}", 
+                                  millis_since_epoch, blink_cycle, frame.blink_rate_ms, show_text);
+                        
+                        if show_text {
+                            log_debug!("ANIMATION: SHOWING TEXT");
+                            return Some(text.clone());
+                        } else {
+                            log_debug!("ANIMATION: HIDING TEXT");
+                            return None;
+                        }
+                    } else {
+                        log_debug!("ANIMATION: Overlay frame has no text");
+                    }
+                } else {
+                    log_debug!("ANIMATION: Frame not ready - overlay: {}, elapsed >= frame: {}", 
+                              frame.overlay, elapsed >= frame.frame);
+                }
+            }
+            log_debug!("ANIMATION: No overlay frames found");
+        } else {
+            log_debug!("ANIMATION: No active animation");
         }
         None
     }

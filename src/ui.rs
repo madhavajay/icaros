@@ -905,7 +905,7 @@ impl App {
                     if let Some(ref active) = self.animation_engine.active_animation {
                         let elapsed = active.start_time.elapsed().as_millis();
                         log_debug!("UI: Animation elapsed: {}ms", elapsed);
-                        if elapsed > 300 {
+                        if elapsed > 200 {
                             log_debug!("UI: Animation delay complete, switching to profile");
                             // Now do the actual profile switch
                             self.switch_to_profile(profile_name);
@@ -1360,15 +1360,49 @@ fn render_profiles(
                 let image_path = frame_content.trim_start_matches("IMAGE:");
                 log_debug!("RENDER: Detected image frame, path: {}", image_path);
                 app.current_image_path = Some(image_path.to_string());
-                render_image_frame(f, area, image_path);
+                
+                // Create layout to get the proper inner pane area
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(5),     // Profile list area
+                        Constraint::Length(3),  // Input area (when active)
+                    ].as_ref())
+                    .split(area);
+                
+                // Use the FULL profile list area for maximum size
+                let image_area = chunks[0];
+                
+                // Render the image at maximum size
+                render_image_frame(f, image_area, image_path);
+                
+                // Always check for overlay text during profile switching, regardless of frame content
+                if let Some(overlay_text) = app.animation_engine.get_overlay_frame() {
+                    render_text_overlay(f, image_area, &overlay_text);
+                }
+                return;
             } else {
                 app.current_image_path = None;
                 render_animation_frame(f, area, &frame_content);
+                return;
             }
-            return;
         } else {
             log_debug!("RENDER: No frame content available");
             app.current_image_path = None;
+        }
+        
+        // Even if no frame content, check for overlay text during profile switching
+        if let Some(overlay_text) = app.animation_engine.get_overlay_frame() {
+            // Create layout to get the proper inner pane area
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(5),     // Profile list area
+                    Constraint::Length(3),  // Input area (when active)
+                ].as_ref())
+                .split(area);
+            
+            render_text_overlay(f, chunks[0], &overlay_text);
         }
     }
     
@@ -1517,8 +1551,21 @@ fn render_image_frame(
                     // This gives us 2x2 pixels per character with unicode blocks
                     let mut picker = Picker::new((1, 2));
                     
-                    // Create the protocol
-                    match picker.new_protocol(dyn_img, image_area, ratatui_image::Resize::Fit(None)) {
+                    // Calculate dimensions to make image width = 100% of panel width
+                    let img_width = dyn_img.width() as f64;
+                    let img_height = dyn_img.height() as f64;
+                    let panel_width = image_area.width as f64;
+                    
+                    // Scale based on width to fill 100% of panel width
+                    let width_scale = panel_width / img_width;
+                    let new_width = panel_width as u32;
+                    let new_height = (img_height * width_scale) as u32;
+                    
+                    // Resize the image to exactly match panel width
+                    let resized_img = dyn_img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
+                    
+                    // Use the resized image with Fit mode
+                    match picker.new_protocol(resized_img, image_area, ratatui_image::Resize::Fit(None)) {
                         Ok(protocol) => {
                             // Create and render the image widget
                             let image = Image::new(&*protocol);
@@ -1554,6 +1601,30 @@ fn show_image_error(f: &mut ratatui::Frame, area: Rect, error: &str) {
         .style(Style::default().bg(Color::Black))
         .alignment(ratatui::layout::Alignment::Center);
     f.render_widget(error_widget, area);
+}
+
+fn render_text_overlay(f: &mut ratatui::Frame, area: Rect, text: &str) {
+    // Use a larger fixed area for ASCII art display
+    let text_width = 50u16;
+    let text_height = 8u16;
+    
+    // Create a centered area for the text
+    let text_area = Rect {
+        x: area.x + (area.width.saturating_sub(text_width)) / 2,
+        y: area.y + (area.height.saturating_sub(text_height)) / 2,
+        width: text_width.min(area.width),
+        height: text_height.min(area.height),
+    };
+    
+    // Create lines from the text with bright yellow color
+    let lines: Vec<Line> = text.lines()
+        .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Rgb(255, 255, 0)).add_modifier(Modifier::BOLD))))
+        .collect();
+    
+    let text_widget = Paragraph::new(lines)
+        .alignment(ratatui::layout::Alignment::Center);
+    
+    f.render_widget(text_widget, text_area);
 }
 
 

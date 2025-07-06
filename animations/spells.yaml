@@ -5,6 +5,10 @@ profile_switch:
   duration_ms: 2000
   frames:
     - frame: 0
+      image: "art/jungle.jpg"
+    - frame: 0
+      overlay: true
+      blink_rate_ms: 100
       text: |
         ███████╗██╗    ██╗██╗████████╗ ██████╗██╗  ██╗
         ██╔════╝██║    ██║██║╚══██╔══╝██╔════╝██║  ██║
@@ -12,5 +16,3 @@ profile_switch:
         ╚════██║██║███╗██║██║   ██║   ██║     ██╔══██║
         ███████║╚███╔███╔╝██║   ██║   ╚██████╗██║  ██║
         ╚══════╝ ╚══╝╚══╝ ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝
-    - frame: 1000
-      image: "art/jungle_small.jpg"
