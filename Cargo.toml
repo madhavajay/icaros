@@ -1,6 +1,6 @@
 [package]
 name = "icaros"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["Madhava Jay"]
 description = "A modern tmux session manager with an interactive TUI"
