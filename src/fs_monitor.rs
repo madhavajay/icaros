@@ -285,7 +285,8 @@ impl FsGuardianMonitor {
         };
         
         if !is_locked {
-            log_to_file(&format!("DEBUG: Path {:?} is not locked, ignoring", path));
+            log_to_file(&format!("✅ ALLOWED: Path {:?} is not locked, allowing {} by {}", 
+                               path, event.operation, event.process_name));
             return Ok(());
         }
         

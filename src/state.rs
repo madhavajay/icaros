@@ -4,6 +4,14 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
 
+fn default_blocked_processes() -> Vec<String> {
+    vec![
+        // Default: just block Claude AI assistants
+        "claude".to_string(),
+        "Claude".to_string(),
+    ]
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LockProfile {
     pub locked_patterns: Vec<String>,
@@ -33,6 +41,9 @@ pub struct AppState {
     
     #[serde(default)]
     pub expanded_dirs: Vec<PathBuf>,
+    
+    #[serde(default = "default_blocked_processes")]
+    pub blocked_processes: Vec<String>,
 }
 
 impl AppState {
@@ -45,19 +56,90 @@ impl AppState {
             unlocked_patterns: vec!["**".to_string()],
             allow_create_patterns: Vec::new(),
             expanded_dirs: Vec::new(),
+            blocked_processes: default_blocked_processes(),
         }
     }
 
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)?;
-        fs::write(path, json)?;
+        // Create YAML with helpful comments
+        let yaml_content = self.to_yaml_with_comments()?;
+        fs::write(path, yaml_content)?;
         Ok(())
+    }
+
+    fn to_yaml_with_comments(&self) -> Result<String> {
+        let mut yaml = String::new();
+        
+        // Add header comment
+        yaml.push_str("# icaros File Guardian Configuration\n");
+        yaml.push_str("# This file controls which files are locked and which processes are blocked\n\n");
+        
+        // Basic fields
+        yaml.push_str(&format!("root_path: \"{}\"\n", self.root_path.display()));
+        
+        if let Some(profile) = &self.active_profile {
+            yaml.push_str(&format!("active_profile: \"{}\"\n", profile));
+        } else {
+            yaml.push_str("active_profile: null\n");
+        }
+        
+        yaml.push_str("profiles: {}\n\n");
+        
+        // Locked patterns
+        yaml.push_str("# Patterns for files/directories to lock (glob patterns)\n");
+        yaml.push_str("locked_patterns:\n");
+        for pattern in &self.locked_patterns {
+            yaml.push_str(&format!("  - \"{}\"\n", pattern));
+        }
+        
+        yaml.push_str("\nunlocked_patterns: []\n");
+        yaml.push_str("allow_create_patterns: []\n\n");
+        
+        // Blocked processes with examples
+        yaml.push_str("# Processes to block when they try to modify locked files\n");
+        yaml.push_str("blocked_processes:\n");
+        for process in &self.blocked_processes {
+            yaml.push_str(&format!("  - \"{}\"\n", process));
+        }
+        
+        yaml.push_str("\n# Additional processes you can block (uncomment to enable):\n");
+        yaml.push_str("# - \"cursor\"      # Cursor editor\n");
+        yaml.push_str("# - \"Cursor\"      # Cursor editor (capitalized)\n");
+        yaml.push_str("# - \"code\"        # VS Code\n");
+        yaml.push_str("# - \"Code\"        # VS Code (capitalized)\n");
+        yaml.push_str("# - \"copilot\"     # GitHub Copilot\n");
+        yaml.push_str("# - \"Copilot\"     # GitHub Copilot (capitalized)\n");
+        yaml.push_str("# - \"vim\"         # Vim editor (useful for testing)\n");
+        yaml.push_str("# - \"nvim\"        # Neovim editor\n");
+        yaml.push_str("# - \"nano\"        # Nano editor\n");
+        yaml.push_str("# - \"emacs\"       # Emacs editor\n\n");
+        
+        // Expanded dirs
+        yaml.push_str("expanded_dirs:\n");
+        for dir in &self.expanded_dirs {
+            yaml.push_str(&format!("  - \"{}\"\n", dir.display()));
+        }
+        
+        Ok(yaml)
     }
 
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)?;
-        let state = serde_json::from_str(&content)?;
-        Ok(state)
+        
+        // Try YAML first (preferred format)
+        if let Ok(state) = serde_yaml::from_str::<Self>(&content) {
+            return Ok(state);
+        }
+        
+        // Fall back to JSON for backward compatibility
+        if let Ok(state) = serde_json::from_str::<Self>(&content) {
+            return Ok(state);
+        }
+        
+        // If both fail, return a helpful error
+        Err(anyhow::anyhow!(
+            "Failed to parse .icaros file as either YAML or JSON. Please check the syntax."
+        ))
     }
 
     pub fn update_expanded_dirs(&mut self, expanded_dirs: Vec<PathBuf>) {

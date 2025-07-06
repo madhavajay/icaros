@@ -24,6 +24,7 @@ use anyhow::Result;
 use std::sync::mpsc::{channel, Receiver};
 use notify::{Watcher, RecursiveMode, Event as NotifyEvent};
 use std::collections::HashSet;
+use std::process::Command;
 
 pub struct App {
     pub tree: TreeNode,
@@ -592,17 +593,34 @@ impl App {
                 log_to_file(&format!("UI: Current UID: {}", uid));
                 
                 if uid != 0 {
-                    // Not running as root, show message
-                    log_to_file("UI: Not running as root, showing error");
-                    self.monitor_events.push(fs_monitor::GuardianEvent::MonitorError(
-                        "File monitoring requires sudo. Please restart icaros with: sudo cargo run".to_string()
-                    ));
+                    // Not running as root, prompt for elevation
+                    log_to_file("UI: Not running as root, prompting for elevation");
+                    if let Err(e) = self.prompt_sudo_elevation() {
+                        log_to_file(&format!("UI: Failed to elevate permissions: {}", e));
+                        self.monitor_events.push(fs_monitor::GuardianEvent::MonitorError(
+                            format!("Failed to elevate permissions: {}", e)
+                        ));
+                    }
                     return;
                 }
                 
-                // Create and start monitor
-                log_to_file("UI: Creating monitor with default config");
-                let config = fs_monitor::MonitorConfig::default();
+                // Create monitor with blocked processes from state
+                log_to_file("UI: Creating monitor with config from state");
+                
+                // Load blocked processes from state file
+                let blocked_processes = if let Ok(state) = crate::state::AppState::load_from_file(&self.state_file) {
+                    log_to_file(&format!("UI: Loaded {} blocked processes from state", state.blocked_processes.len()));
+                    for process in &state.blocked_processes {
+                        log_to_file(&format!("  - Blocking: {}", process));
+                    }
+                    state.blocked_processes
+                } else {
+                    log_to_file("UI: Using default blocked processes");
+                    vec!["vim".to_string(), "nvim".to_string()]
+                };
+                
+                let mut config = fs_monitor::MonitorConfig::default();
+                config.monitored_processes = blocked_processes;
                 
                 match fs_monitor::FsGuardianMonitor::new(config, self.root_path.clone()) {
                     Ok(mut monitor) => {
@@ -643,6 +661,61 @@ impl App {
         {
             log_to_file("UI: Not on macOS, monitoring not available");
             self.monitor_events.push("File monitoring is only available on macOS".to_string());
+        }
+    }
+    
+    #[cfg(target_os = "macos")]
+    fn prompt_sudo_elevation(&self) -> Result<()> {
+        log_to_file("UI: Prompting for sudo elevation");
+        
+        // Temporarily disable raw mode to show system prompts
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        
+        println!("\n🛡️  File monitoring requires administrator privileges.");
+        println!("icaros will restart with sudo to enable monitoring...");
+        println!("");
+        
+        // Get current executable arguments
+        let current_exe = std::env::current_exe()?;
+        let args: Vec<String> = std::env::args().collect();
+        
+        log_to_file(&format!("UI: Current exe: {:?}", current_exe));
+        log_to_file(&format!("UI: Current args: {:?}", args));
+        
+        // Build command to restart with sudo
+        let mut cmd = Command::new("sudo");
+        
+        // If we're running via cargo, restart with cargo
+        if args[0].contains("cargo") || std::env::var("CARGO_PKG_NAME").is_ok() {
+            cmd.arg("cargo").arg("run").arg("--");
+            // Add any arguments after the program name
+            for arg in args.iter().skip(1) {
+                cmd.arg(arg);
+            }
+        } else {
+            // Direct binary execution
+            cmd.arg(&current_exe);
+            for arg in args.iter().skip(1) {
+                cmd.arg(arg);
+            }
+        }
+        
+        log_to_file(&format!("UI: Executing sudo command: {:?}", cmd));
+        
+        // Execute the command
+        let status = cmd.status()?;
+        
+        if status.success() {
+            log_to_file("UI: Sudo restart successful");
+            // Exit this instance since the new one is running
+            std::process::exit(0);
+        } else {
+            log_to_file(&format!("UI: Sudo restart failed with status: {:?}", status));
+            // Re-enable raw mode and return to UI
+            enable_raw_mode()?;
+            execute!(io::stdout(), EnterAlternateScreen)?;
+            Err(anyhow::anyhow!("Sudo elevation cancelled or failed"))
         }
     }
     
@@ -1369,9 +1442,9 @@ fn render_file_guardian(
         })
         .collect();
 
-    // Add monitor status to title
+    // Add shield icon to title when monitoring is active
     let title = if app.monitor.is_some() {
-        " 🦙 File Guardian 🦙 [🛡️ Monitor Active] "
+        " 🦙🛡️ File Guardian 🦙 "
     } else {
         " 🦙 File Guardian 🦙 "
     };
@@ -2088,6 +2161,27 @@ fn run_app<B: ratatui::backend::Backend>(
                                         log_to_file("UI: 'm' key pressed, calling toggle_monitoring");
                                         app.toggle_monitoring();
                                     }
+                                    KeyCode::Char('b') => {
+                                        // Show blocked processes (for now just log them)
+                                        log_to_file("UI: 'b' key pressed, showing blocked processes");
+                                        if let Ok(state) = crate::state::AppState::load_from_file(&app.state_file) {
+                                            let mut message = "🚫 Blocked Processes:\n".to_string();
+                                            if state.blocked_processes.is_empty() {
+                                                message.push_str("  (none)");
+                                            } else {
+                                                for process in &state.blocked_processes {
+                                                    message.push_str(&format!("  - {}\n", process));
+                                                }
+                                            }
+                                            message.push_str("\nEdit .icaros file to modify blocked processes");
+                                            
+                                            // Add as a monitor event for display
+                                            #[cfg(target_os = "macos")]
+                                            app.monitor_events.push(fs_monitor::GuardianEvent::MonitorError(message));
+                                            #[cfg(not(target_os = "macos"))]
+                                            app.monitor_events.push(message);
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -2203,10 +2297,16 @@ fn render_compact_tabs(
     app: &App,
     area: Rect,
 ) {
+    let guardian_tab = if app.monitor.is_some() {
+        " 🦙🛡️ File Guardian "
+    } else {
+        " 🦙 File Guardian "
+    };
+    
     let tab_titles = match app.active_tab {
-        TabIndex::FileGuardian => " 🦙 File Guardian | Git Stage | Profiles ",
-        TabIndex::GitStage => " File Guardian | 🔧 Git Stage | Profiles ",
-        TabIndex::Profiles => " File Guardian | Git Stage | 🏜️ Profiles ",
+        TabIndex::FileGuardian => format!("{}| Git Stage | Profiles ", guardian_tab),
+        TabIndex::GitStage => format!("{}| 🔧 Git Stage | Profiles ", guardian_tab),
+        TabIndex::Profiles => format!("{}| Git Stage | 🏜️ Profiles ", guardian_tab),
     };
     
     let tab_line = Line::from(vec![
