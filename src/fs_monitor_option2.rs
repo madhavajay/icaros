@@ -19,6 +19,11 @@ fn log_to_file(message: &str) {
     let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
     let log_message = format!("[{}] {}\n", timestamp, message);
     
+    // Create logs directory if it doesn't exist
+    if let Err(_) = std::fs::create_dir_all("logs") {
+        return; // Can't create directory, can't log
+    }
+    
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)

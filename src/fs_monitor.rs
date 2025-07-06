@@ -19,6 +19,11 @@ fn log_to_file(message: &str) {
     let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
     let log_message = format!("[{}] {}\n", timestamp, message);
     
+    // Create logs directory if it doesn't exist
+    if let Err(_) = std::fs::create_dir_all("logs") {
+        return; // Can't create directory, can't log
+    }
+    
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
@@ -138,8 +143,13 @@ impl FsGuardianMonitor {
         log_to_file(&format!("MONITOR: Building monitor for path: {}", root_path.display()));
         
         // Build the monitor with our configuration
+        let watch_pattern1 = format!("{}/**/*", root_path.display());
+        let watch_pattern2 = format!("{}/*", root_path.display());
+        log_to_file(&format!("MONITOR: Watch patterns: {} and {}", watch_pattern1, watch_pattern2));
+        
         let builder = FsUsageMonitorBuilder::new()
-            .watch_path(format!("{}/**/*", root_path.display()))
+            .watch_path(watch_pattern1)
+            .watch_path(watch_pattern2)
             // Remove write_only to catch all file operations including renames, moves, etc.
             .exclude_process("mds")
             .exclude_process("mdworker")
@@ -170,8 +180,13 @@ impl FsGuardianMonitor {
         thread::spawn(move || {
             log_to_file("MONITOR: Monitoring thread started");
             let mut event_count = 0;
+            let mut loop_count = 0;
             
             while *is_running.read().unwrap() {
+                loop_count += 1;
+                if loop_count % 100 == 0 {  // Every 10 seconds (100 * 100ms)
+                    log_to_file(&format!("MONITOR: Thread alive, loop #{}, {} events so far", loop_count, event_count));
+                }
                 match monitor_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => {
                         event_count += 1;
@@ -237,15 +252,16 @@ impl FsGuardianMonitor {
         event_tx: &Sender<GuardianEvent>,
         stash_manager: &StashManager,
     ) -> Result<()> {
+        // Log ALL events for debugging
+        log_to_file(&format!("FS_EVENT: {} [{}] {} (PID: {})", 
+                  event.process_name, event.operation, event.path, event.pid));
+        
         // Check if this is from a monitored process
         let is_monitored = config.monitored_processes.is_empty() || 
             config.monitored_processes.iter().any(|p| event.process_name.contains(p));
         
-        log_to_file(&format!("DEBUG: Event from process '{}' (PID: {}), monitored: {}", 
-                  event.process_name, event.pid, is_monitored));
-        
         if !is_monitored {
-            log_to_file(&format!("DEBUG: Process '{}' not in monitored list", event.process_name));
+            log_to_file(&format!("DEBUG: Process '{}' not in monitored list - allowing", event.process_name));
             
             // IMPORTANT: Update backup for non-monitored processes (allowed writes)
             // This ensures vim reverts to the latest allowed version, not the initial backup

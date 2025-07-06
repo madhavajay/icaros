@@ -158,6 +158,11 @@ fn log_to_file(message: &str) {
     let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
     let log_message = format!("[{}] {}\n", timestamp, message);
     
+    // Create logs directory if it doesn't exist
+    if let Err(_) = std::fs::create_dir_all("logs") {
+        return; // Can't create directory, can't log
+    }
+    
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
@@ -228,6 +233,11 @@ impl App {
         if !app.git_files.is_empty() {
             app.git_file_list_state.select(Some(0));
         }
+        
+        // Auto-start monitoring
+        log_to_file("UI: Auto-starting monitoring");
+        app.toggle_monitoring();
+        
         app
     }
 
@@ -739,9 +749,20 @@ impl App {
             for pattern in &state.locked_patterns {
                 log_to_file(&format!("DEBUG: Processing pattern: {}", pattern));
                 
+                // Handle special case: ** means monitor the root directory
+                if pattern == "**" {
+                    paths.push(self.root_path.clone());
+                    log_to_file(&format!("DEBUG: Added root path for ** pattern: {:?}", self.root_path));
+                    continue;
+                }
+                
                 // Remove /** from end if present and convert to absolute path
                 let clean_pattern = pattern.trim_end_matches("/**").trim_end_matches("/*");
-                let abs_path = self.root_path.join(clean_pattern);
+                let abs_path = if clean_pattern.is_empty() {
+                    self.root_path.clone()
+                } else {
+                    self.root_path.join(clean_pattern)
+                };
                 
                 if abs_path.exists() {
                     paths.push(abs_path.clone());
@@ -2075,10 +2096,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
                 
-                // Render monitor notifications if any
-                if app.show_monitor_notifications && !app.monitor_events.is_empty() {
-                    render_monitor_notifications(f, app, chunks[1]);
-                }
+                // Monitor status is now shown via shield icon in tab/title
             }
         })?;
 
@@ -2157,10 +2175,10 @@ fn run_app<B: ratatui::backend::Backend>(
                                         app.show_hidden = !app.show_hidden;
                                         app.update_items();
                                     }
-                                    KeyCode::Char('m') => {
-                                        log_to_file("UI: 'm' key pressed, calling toggle_monitoring");
-                                        app.toggle_monitoring();
-                                    }
+                                    // KeyCode::Char('m') => {
+                                    //     log_to_file("UI: 'm' key pressed, calling toggle_monitoring");
+                                    //     app.toggle_monitoring();
+                                    // }
                                     KeyCode::Char('b') => {
                                         // Show blocked processes (for now just log them)
                                         log_to_file("UI: 'b' key pressed, showing blocked processes");
