@@ -1417,47 +1417,124 @@ fn render_profile_switch_animation(
     let width = area.width as usize;
     let height = area.height as usize;
     
-    // ASCII jungle art from chafa conversion
-    let jungle_art = vec![
-        "▃▉▘▖▁▆▃▝▂▃▘┓▝▄╴▂┊▗╺╸╵▃▉▁▘▂▇▃╱▃╺▅▄▖┊┏▘▄┲▝",
-        "▚▆▃▂▗▝▝▝▏┣▉▃╵▗▗▋▎▄▘▖╺╺╵▍▄┓┲┛▅▝▘▇▍▂▏▚▇▄▃▃",
-        "▄▄▉▆┪╸▗▇▘▝▎┙▉▌▏▋▝┭▃▂▁▃▎▍▖▝▍━┓▖▘▚╾▉▝▂▘┒┖▌",
-        "▅▎▗┓╶▄┓▎▍╻▁┡▉▌┊▋▌┒▁╱▃╵▂▖▝╹▂▍▝▗┊▄▃┙▘▄▗▝▗",
-        "╴▝▊▝▚▏▊▎▝╹▄╾┗┗▖▋▅╾▃▇▆┓┙▗▁╶▝▘▄▋▆╸╻╾▏▍┏▃▚▗",
-        "╺╸╿▋▘▚┛▃▊▍▌▏▋▎▆▃━▂▍▄▆┃┊┑▝▇▅━▄▘▌┃▝▗▘▚▂╵▖┃▘",
-        "│▉▂┃▚▊┣▌▇▘▃▊▎╶▊┗━▂▝▁▗▇▃┻▎▊╻▖▂┃▘▄▘▎",
-        "▋┿▂┃▖▖┑▉▁▁▁╎┦┎╴╽▖▄▍▊╺▚━┑▘▄┙┓▖╱┗┙▁╶▝▘▄▊╺╾┌▍┏▃▚",
-        "┙▊╱╻▍╹▗▅▚▎▃╸╻╾▏▍┏▃▚▗┏┃▖▆╼┏▅▍▁▇▘▚▄▗▋▇▄▊┌▂▃▖",
-        "▁┿▂┃▖▖┑▉▁▁▁╎┦┎╴╽▖▄▍▊╺▚━┑▘▄┙┓▖▀▉╺╾▄▎▊┌▁▃╸▗"
+    // ANSI Shadow style "SWITCH" text
+    let switch_text = vec![
+        "███████╗██╗    ██╗██╗████████╗ ██████╗██╗  ██╗",
+        "██╔════╝██║    ██║██║╚══██╔══╝██╔════╝██║  ██║",
+        "███████╗██║ █╗ ██║██║   ██║   ██║     ███████║",
+        "╚════██║██║███╗██║██║   ██║   ██║     ██╔══██║",
+        "███████║╚███╔███╔╝██║   ██║   ╚██████╗██║  ██║",
+        "╚══════╝ ╚══╝╚══╝ ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝",
     ];
     
-    // Create animated desert with jungle overlay
+    // Custom jungle ASCII art for decoration
+    let jungle_art = vec![
+        "    🌴  🦜  🌿  🌺  🐆  🌿  🦜  🌴    ",
+        "      🌿 🌴 🌿  🦎  🌿 🌴 🌿      ",
+        "    🐒  🌿🌺🌿  🦋  🌿🌺🌿  🐒    ",
+        "      🌴  🌿  🐍  🌿  🌴      ",
+        "    🦜 🌿 🌴 🌿 🦜 🌿 🌴 🌿 🦜    ",
+    ];
+    
+    // Create animated screen
     let mut lines = Vec::new();
     
-    for y in 0..height {
-        let mut spans = Vec::new();
+    // Check if we're in the switch screen phase (middle of animation)
+    let show_switch_screen = progress > 0.3 && progress < 0.7;
+    
+    if show_switch_screen {
+        // Center the SWITCH text
+        let text_width = switch_text[0].chars().count();
+        let text_height = switch_text.len();
+        let x_offset = width.saturating_sub(text_width) / 2;
+        let y_offset = height.saturating_sub(text_height + jungle_art.len() + 4) / 2;
         
-        for x in 0..width {
-            // Choose character based on animation progress and position
-            let char_to_show = if progress > 0.5 && y < jungle_art.len() {
-                // Show jungle during second half of animation
-                let jungle_line = &jungle_art[y];
-                let jungle_chars: Vec<char> = jungle_line.chars().collect();
-                if x < jungle_chars.len() {
-                    jungle_chars[x].to_string()
-                } else {
-                    " ".to_string()
+        for y in 0..height {
+            let mut spans = Vec::new();
+            
+            for x in 0..width {
+                // Draw SWITCH text
+                if y >= y_offset && y < y_offset + text_height && 
+                   x >= x_offset && x < x_offset + text_width {
+                    let text_y = y - y_offset;
+                    let text_x = x - x_offset;
+                    let line_chars: Vec<char> = switch_text[text_y].chars().collect();
+                    if text_x < line_chars.len() {
+                        let ch = line_chars[text_x];
+                        let color = if ch != ' ' {
+                            // Gradient effect based on progress
+                            let intensity = ((progress - 0.3) / 0.4 * 255.0) as u8;
+                            Color::Rgb(intensity, 255 - intensity / 2, 0)
+                        } else {
+                            Color::Reset
+                        };
+                        spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
+                    } else {
+                        spans.push(Span::raw(" "));
+                    }
                 }
-            } else if y < height / 3 {
-                // Sky area - stars appear based on progress
-                if (x + y) % 12 == 0 && progress > 0.2 {
-                    "⭐".to_string()
-                } else if (x + y * 2) % 16 == 0 && progress > 0.4 {
-                    "✦".to_string()
-                } else {
-                    " ".to_string()
+                // Draw jungle art below SWITCH text
+                else if y >= y_offset + text_height + 2 && 
+                        y < y_offset + text_height + 2 + jungle_art.len() {
+                    let art_y = y - y_offset - text_height - 2;
+                    let art_width = jungle_art[art_y].chars().count();
+                    let art_x_offset = width.saturating_sub(art_width) / 2;
+                    
+                    if x >= art_x_offset && x < art_x_offset + art_width {
+                        let art_x = x - art_x_offset;
+                        let line_chars: Vec<char> = jungle_art[art_y].chars().collect();
+                        if art_x < line_chars.len() {
+                            spans.push(Span::styled(
+                                line_chars[art_x].to_string(),
+                                Style::default().fg(Color::Green)
+                            ));
+                        } else {
+                            spans.push(Span::raw(" "));
+                        }
+                    } else {
+                        spans.push(Span::raw(" "));
+                    }
                 }
-            } else if y < height * 2 / 3 {
+                // Background pattern
+                else {
+                    let bg_char = if (x + y) % 20 == 0 && progress > 0.4 {
+                        "·"
+                    } else if (x * 2 + y) % 30 == 0 && progress > 0.5 {
+                        "˚"
+                    } else {
+                        " "
+                    };
+                    spans.push(Span::styled(bg_char, Style::default().fg(Color::DarkGray)));
+                }
+            }
+            lines.push(Line::from(spans));
+        }
+    } else {
+        // Original desert to jungle transition
+        for y in 0..height {
+            let mut spans = Vec::new();
+            
+            for x in 0..width {
+                // Choose character based on animation progress and position
+                let char_to_show = if progress > 0.7 && y < height / 3 {
+                    // Jungle canopy
+                    if (x + y) % 5 == 0 {
+                        "🌴".to_string()
+                    } else if (x * 2 + y) % 7 == 0 {
+                        "🌿".to_string()
+                    } else {
+                        " ".to_string()
+                    }
+                } else if y < height / 3 {
+                    // Sky area - stars appear based on progress
+                    if (x + y) % 12 == 0 && progress > 0.2 {
+                        "⭐".to_string()
+                    } else if (x + y * 2) % 16 == 0 && progress > 0.4 {
+                        "✦".to_string()
+                    } else {
+                        " ".to_string()
+                    }
+                } else if y < height * 2 / 3 {
                 // Pyramid and desert area
                 let pyramid_center_x = width / 2;
                 let pyramid_y = height / 2;
@@ -1511,33 +1588,16 @@ fn render_profile_switch_animation(
         }
         
         lines.push(Line::from(spans));
-    }
-    
-    // Progress text with jungle theme
-    let progress_text = if progress > 0.5 {
-        format!("🌿 Morphing to Jungle Profile... {:.0}% 🌿", progress * 100.0)
-    } else {
-        format!("🏜️ Switching Profile... {:.0}% 🐪", progress * 100.0)
-    };
-    
-    if !lines.is_empty() {
-        let center_x = (width / 2).saturating_sub(progress_text.len() / 2);
-        let center_y = height / 8;
-        
-        if center_y < lines.len() {
-            lines[center_y] = Line::from(vec![
-                Span::raw(" ".repeat(center_x)),
-                Span::styled(progress_text, Style::default()
-                    .fg(if progress > 0.5 { Color::Green } else { Color::Yellow })
-                    .add_modifier(Modifier::BOLD)),
-            ]);
         }
     }
     
-    let title = if progress > 0.5 {
-        " 🌿 Jungle Transformation 🌿 "
+    // Title based on animation phase
+    let title = if show_switch_screen {
+        " 🎮 Profile Switch 🎮 "
+    } else if progress > 0.7 {
+        " 🌿 Welcome to the Jungle 🌿 "
     } else {
-        " 🏜️ Desert Mirage 🏜️ "
+        " 🏜️ Leaving the Desert 🏜️ "
     };
     
     let animation_paragraph = Paragraph::new(lines)
