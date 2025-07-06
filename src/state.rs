@@ -49,14 +49,14 @@ impl AppState {
     }
 
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)?;
-        fs::write(path, json)?;
+        let yaml = serde_yaml::to_string(self)?;
+        fs::write(path, yaml)?;
         Ok(())
     }
 
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)?;
-        let state = serde_json::from_str(&content)?;
+        let state = serde_yaml::from_str(&content)?;
         Ok(state)
     }
 
