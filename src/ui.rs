@@ -1,5 +1,7 @@
 use crate::file_tree::TreeNode;
 use crate::git::{GitManager, GitFile, GitHunk};
+use crate::animations::AnimationEngine;
+use crate::log_debug;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -51,7 +53,6 @@ pub struct App {
     pub git_pane: GitPane,
     pub show_help: bool,
     // Profile system
-    pub show_profile_menu: bool,
     pub profile_list_state: ListState,
     pub profile_names: Vec<String>,
     pub active_profile_name: Option<String>,
@@ -59,9 +60,11 @@ pub struct App {
     pub profile_input_buffer: String,
     pub profile_action: ProfileAction,
     // Animation system
-    pub animation_state: AnimationState,
-    pub animation_start: Option<Instant>,
     pub profile_switching: bool,
+    // Simple animation engine
+    pub animation_engine: AnimationEngine,
+    // Delayed profile switch
+    pub pending_profile_switch: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -75,21 +78,8 @@ pub enum TabIndex {
 pub enum ProfileAction {
     None,
     Save,
-    Load,
-    Delete,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum AnimationState {
-    None,
-    ProfileSwitch {
-        progress: f32,
-        pyramid_scale: f32,
-        llama_offset: f32,
-        cactus_sway: f32,
-        desert_fade: f32,
-    },
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GitPane {
@@ -175,22 +165,31 @@ impl App {
             git_selected_hunk: 0,
             git_pane: GitPane::FileList,
             show_help: false,
-            show_profile_menu: false,
             profile_list_state: ListState::default(),
             profile_names: Vec::new(),
             active_profile_name: None,
             profile_input_mode: false,
             profile_input_buffer: String::new(),
             profile_action: ProfileAction::None,
-            animation_state: AnimationState::None,
-            animation_start: None,
             profile_switching: false,
+            animation_engine: AnimationEngine::new(),
+            pending_profile_switch: None,
         };
         app.update_items();
         app.list_state.select(Some(0));
         if !app.git_files.is_empty() {
             app.git_file_list_state.select(Some(0));
         }
+        
+        // Load animation spells
+        log_debug!("UI: Loading animation spells");
+        if let Err(e) = app.animation_engine.load_spells() {
+            log_debug!("UI: ERROR - Failed to load animation spells: {}", e);
+            eprintln!("Warning: Failed to load animation spells: {}", e);
+        } else {
+            log_debug!("UI: Animation spells loaded successfully");
+        }
+        
         app
     }
 
@@ -240,6 +239,7 @@ impl App {
             // Determine the effective lock state of this path
             let was_locked = self.is_path_effectively_locked(&path);
             
+            
             if std::env::var("ICAROS_DEBUG").is_ok() {
                 eprintln!("Toggle: {:?}, was_locked: {}", path, was_locked);
                 eprintln!("  Explicitly locked: {:?}", self.explicitly_locked_paths);
@@ -250,6 +250,9 @@ impl App {
             if !was_locked {
                 // LOCKING a node
                 self.explicitly_locked_paths.push(path.clone());
+                
+                // Trigger lock animation
+                self.animation_engine.trigger("file_locked");
                 
                 // Remove this path from explicitly unlocked if it was there
                 self.explicitly_unlocked_paths.retain(|p| p != &path);
@@ -269,6 +272,9 @@ impl App {
                 if is_explicitly_locked {
                     // Remove the explicit lock
                     self.explicitly_locked_paths.retain(|p| p != &path);
+                    
+                    // Trigger unlock animation
+                    self.animation_engine.trigger("file_unlocked");
                     
                     // If unlocking a directory that was explicitly locked,
                     // remove redundant child states
@@ -376,7 +382,7 @@ impl App {
         false
     }
     
-    fn has_unlocked_ancestor(&self, path: &std::path::Path) -> bool {
+    fn _has_unlocked_ancestor(&self, path: &std::path::Path) -> bool {
         for unlocked_path in &self.explicitly_unlocked_paths {
             if unlocked_path != path && path.starts_with(unlocked_path) {
                 return true;
@@ -752,12 +758,30 @@ impl App {
     }
     
     pub fn load_selected_profile(&mut self) {
+        log_debug!("UI: load_selected_profile called");
         if let Some(selected) = self.profile_list_state.selected() {
+            log_debug!("UI: Selected profile index: {}", selected);
             if selected < self.profile_names.len() {
                 let profile_name = self.profile_names[selected].clone();
-                self.start_profile_switch_animation();
-                self.switch_to_profile(&profile_name);
+                log_debug!("UI: Loading profile: '{}'", profile_name);
+                log_debug!("UI: Animations enabled: {}", self.animations_enabled);
+                
+                if self.animations_enabled {
+                    log_debug!("UI: Starting profile switch animation");
+                    self.start_profile_switch_animation();
+                    // Delay the actual profile switch until animation shows
+                    self.pending_profile_switch = Some(profile_name.clone());
+                    log_debug!("UI: Set pending profile switch to: '{}'", profile_name);
+                } else {
+                    log_debug!("UI: No animation, switching immediately");
+                    // No animation, switch immediately
+                    self.switch_to_profile(&profile_name);
+                }
+            } else {
+                log_debug!("UI: ERROR - Selected index {} out of bounds ({})", selected, self.profile_names.len());
             }
+        } else {
+            log_debug!("UI: ERROR - No profile selected");
         }
     }
     
@@ -857,35 +881,43 @@ impl App {
     }
     
     pub fn start_profile_switch_animation(&mut self) {
-        self.animation_state = AnimationState::ProfileSwitch {
-            progress: 0.0,
-            pyramid_scale: 1.0,
-            llama_offset: 0.0,
-            cactus_sway: 0.0,
-            desert_fade: 0.0,
-        };
-        self.animation_start = Some(Instant::now());
+        log_debug!("UI: start_profile_switch_animation called");
+        self.animation_engine.trigger("profile_switch");
         self.profile_switching = true;
+        log_debug!("UI: Profile switching flag set to true");
     }
     
     pub fn update_profile_animation(&mut self) {
-        if let Some(start_time) = self.animation_start {
-            let elapsed = start_time.elapsed().as_secs_f32();
-            let progress = (elapsed / 2.0).min(1.0); // 2 second animation
-            
-            if let AnimationState::ProfileSwitch { .. } = &mut self.animation_state {
-                self.animation_state = AnimationState::ProfileSwitch {
-                    progress,
-                    pyramid_scale: 1.0 + (progress * 2.0).sin() * 0.3,
-                    llama_offset: (progress * 8.0).sin() * 10.0,
-                    cactus_sway: (progress * 6.0).sin() * 5.0,
-                    desert_fade: (progress * std::f32::consts::PI).sin(),
-                };
+        // Check if we need to execute the delayed profile switch
+        if self.profile_switching {
+            log_debug!("UI: update_profile_animation - profile_switching=true");
+            if let Some(ref profile_name) = self.pending_profile_switch.clone() {
+                log_debug!("UI: Pending profile switch: '{}'", profile_name);
+                if self.animation_engine.is_active() {
+                    log_debug!("UI: Animation is active");
+                    // Animation is active, wait a bit for it to show
+                    if let Some(ref active) = self.animation_engine.active_animation {
+                        let elapsed = active.start_time.elapsed().as_millis();
+                        log_debug!("UI: Animation elapsed: {}ms", elapsed);
+                        if elapsed > 300 {
+                            log_debug!("UI: Animation delay complete, switching to profile");
+                            // Now do the actual profile switch
+                            self.switch_to_profile(profile_name);
+                            self.pending_profile_switch = None;
+                        }
+                    }
+                } else {
+                    log_debug!("UI: Animation not active, switching immediately");
+                    // Animation failed to start or already ended, switch immediately
+                    self.switch_to_profile(profile_name);
+                    self.pending_profile_switch = None;
+                    self.profile_switching = false;
+                }
             }
             
-            if progress >= 1.0 {
-                self.animation_state = AnimationState::None;
-                self.animation_start = None;
+            // Clear the switching flag when animation ends
+            if !self.animation_engine.is_active() && self.pending_profile_switch.is_none() {
+                log_debug!("UI: Animation ended, clearing profile_switching flag");
                 self.profile_switching = false;
             }
         }
@@ -1312,16 +1344,15 @@ fn render_profiles(
     area: Rect,
 ) {
     // Check if profile switching animation is active
-    if let AnimationState::ProfileSwitch {
-        progress,
-        pyramid_scale,
-        llama_offset,
-        cactus_sway,
-        desert_fade,
-    } = app.animation_state
-    {
-        render_profile_switch_animation(f, area, progress, pyramid_scale, llama_offset, cactus_sway, desert_fade);
-        return;
+    if app.profile_switching {
+        log_debug!("RENDER: Profile switching active, checking for animation frame");
+        if let Some(frame_content) = app.animation_engine.get_current_frame() {
+            log_debug!("RENDER: Got frame content, rendering animation");
+            render_animation_frame(f, area, &frame_content);
+            return;
+        } else {
+            log_debug!("RENDER: No frame content available");
+        }
     }
     
     let chunks = Layout::default()
@@ -1405,209 +1436,31 @@ fn render_profiles(
     }
 }
 
-fn render_profile_switch_animation(
+fn render_animation_frame(
     f: &mut ratatui::Frame,
     area: Rect,
-    progress: f32,
-    pyramid_scale: f32,
-    llama_offset: f32,
-    cactus_sway: f32,
-    desert_fade: f32,
+    content: &str,
 ) {
-    let width = area.width as usize;
-    let height = area.height as usize;
+    // Clear the entire area first
+    let clear_widget = Block::default()
+        .style(Style::default().bg(Color::Black));
+    f.render_widget(clear_widget, area);
     
-    // ANSI Shadow style "SWITCH" text
-    let switch_text = vec![
-        "███████╗██╗    ██╗██╗████████╗ ██████╗██╗  ██╗",
-        "██╔════╝██║    ██║██║╚══██╔══╝██╔════╝██║  ██║",
-        "███████╗██║ █╗ ██║██║   ██║   ██║     ███████║",
-        "╚════██║██║███╗██║██║   ██║   ██║     ██╔══██║",
-        "███████║╚███╔███╔╝██║   ██║   ╚██████╗██║  ██║",
-        "╚══════╝ ╚══╝╚══╝ ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝",
-    ];
+    // Split content into lines
+    let lines: Vec<&str> = content.lines().collect();
     
-    // Custom jungle ASCII art for decoration
-    let jungle_art = vec![
-        "    🌴  🦜  🌿  🌺  🐆  🌿  🦜  🌴    ",
-        "      🌿 🌴 🌿  🦎  🌿 🌴 🌿      ",
-        "    🐒  🌿🌺🌿  🦋  🌿🌺🌿  🐒    ",
-        "      🌴  🌿  🐍  🌿  🌴      ",
-        "    🦜 🌿 🌴 🌿 🦜 🌿 🌴 🌿 🦜    ",
-    ];
-    
-    // Create animated screen
-    let mut lines = Vec::new();
-    
-    // Check if we're in the switch screen phase (middle of animation)
-    let show_switch_screen = progress > 0.3 && progress < 0.7;
-    
-    if show_switch_screen {
-        // Center the SWITCH text
-        let text_width = switch_text[0].chars().count();
-        let text_height = switch_text.len();
-        let x_offset = width.saturating_sub(text_width) / 2;
-        let y_offset = height.saturating_sub(text_height + jungle_art.len() + 4) / 2;
-        
-        for y in 0..height {
-            let mut spans = Vec::new();
-            
-            for x in 0..width {
-                // Draw SWITCH text
-                if y >= y_offset && y < y_offset + text_height && 
-                   x >= x_offset && x < x_offset + text_width {
-                    let text_y = y - y_offset;
-                    let text_x = x - x_offset;
-                    let line_chars: Vec<char> = switch_text[text_y].chars().collect();
-                    if text_x < line_chars.len() {
-                        let ch = line_chars[text_x];
-                        let color = if ch != ' ' {
-                            // Gradient effect based on progress
-                            let intensity = ((progress - 0.3) / 0.4 * 255.0) as u8;
-                            Color::Rgb(intensity, 255 - intensity / 2, 0)
-                        } else {
-                            Color::Reset
-                        };
-                        spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
-                    } else {
-                        spans.push(Span::raw(" "));
-                    }
-                }
-                // Draw jungle art below SWITCH text
-                else if y >= y_offset + text_height + 2 && 
-                        y < y_offset + text_height + 2 + jungle_art.len() {
-                    let art_y = y - y_offset - text_height - 2;
-                    let art_width = jungle_art[art_y].chars().count();
-                    let art_x_offset = width.saturating_sub(art_width) / 2;
-                    
-                    if x >= art_x_offset && x < art_x_offset + art_width {
-                        let art_x = x - art_x_offset;
-                        let line_chars: Vec<char> = jungle_art[art_y].chars().collect();
-                        if art_x < line_chars.len() {
-                            spans.push(Span::styled(
-                                line_chars[art_x].to_string(),
-                                Style::default().fg(Color::Green)
-                            ));
-                        } else {
-                            spans.push(Span::raw(" "));
-                        }
-                    } else {
-                        spans.push(Span::raw(" "));
-                    }
-                }
-                // Background pattern
-                else {
-                    let bg_char = if (x + y) % 20 == 0 && progress > 0.4 {
-                        "·"
-                    } else if (x * 2 + y) % 30 == 0 && progress > 0.5 {
-                        "˚"
-                    } else {
-                        " "
-                    };
-                    spans.push(Span::styled(bg_char, Style::default().fg(Color::DarkGray)));
-                }
-            }
-            lines.push(Line::from(spans));
-        }
-    } else {
-        // Original desert to jungle transition
-        for y in 0..height {
-            let mut spans = Vec::new();
-            
-            for x in 0..width {
-                // Choose character based on animation progress and position
-                let char_to_show = if progress > 0.7 && y < height / 3 {
-                    // Jungle canopy
-                    if (x + y) % 5 == 0 {
-                        "🌴".to_string()
-                    } else if (x * 2 + y) % 7 == 0 {
-                        "🌿".to_string()
-                    } else {
-                        " ".to_string()
-                    }
-                } else if y < height / 3 {
-                    // Sky area - stars appear based on progress
-                    if (x + y) % 12 == 0 && progress > 0.2 {
-                        "⭐".to_string()
-                    } else if (x + y * 2) % 16 == 0 && progress > 0.4 {
-                        "✦".to_string()
-                    } else {
-                        " ".to_string()
-                    }
-                } else if y < height * 2 / 3 {
-                // Pyramid and desert area
-                let pyramid_center_x = width / 2;
-                let pyramid_y = height / 2;
-                let scaled_size = (8.0 + 4.0 * pyramid_scale) as usize;
-                
-                if y.abs_diff(pyramid_y) < scaled_size / 3 && x.abs_diff(pyramid_center_x) < scaled_size / 2 {
-                    "▲".to_string()
-                } else if x % (12 + ((cactus_sway * 3.0) as usize % 6)) == 3 {
-                    "🌵".to_string()
-                } else if (x + y) % 20 == 0 {
-                    "🪨".to_string()
-                } else {
-                    " ".to_string()
-                }
-            } else {
-                // Ground area
-                if x % 18 == 4 {
-                    "🏜️".to_string()
-                } else if (x * 3) % 25 == 0 {
-                    "⋅".to_string()
-                } else {
-                    " ".to_string()
-                }
-            };
-            
-            // Llama position - moves across screen
-            let llama_x = (width as f32 / 3.0 + llama_offset * 2.0) as usize;
-            let llama_y = height * 3 / 4;
-            
-            if x == llama_x && y == llama_y {
-                spans.push(Span::styled("🦙", Style::default().fg(Color::Rgb(255, 215, 0))));
-            } else {
-                // Color scheme: jungle green transitioning to desert brown
-                let color = if progress > 0.5 {
-                    // Jungle colors
-                    Color::Rgb(
-                        (10 + (progress * 50.0) as u8).min(255),
-                        (80 + (progress * 80.0) as u8).min(255),
-                        (20 + (progress * 40.0) as u8).min(255),
-                    )
-                } else {
-                    // Desert colors
-                    Color::Rgb(
-                        (139 as f32 * desert_fade) as u8,
-                        (100 + (desert_fade * 69.0) as u8).min(255),
-                        (19 + (desert_fade * 40.0) as u8).min(255),
-                    )
-                };
-                spans.push(Span::styled(char_to_show, Style::default().fg(color)));
-            }
-        }
-        
-        lines.push(Line::from(spans));
-        }
+    // Create the paragraph with all lines
+    let mut text_lines = Vec::new();
+    for line in &lines {
+        text_lines.push(Line::from(Span::styled(*line, Style::default().fg(Color::Cyan))));
     }
     
-    // Title based on animation phase
-    let title = if show_switch_screen {
-        " 🎮 Profile Switch 🎮 "
-    } else if progress > 0.7 {
-        " 🌿 Welcome to the Jungle 🌿 "
-    } else {
-        " 🏜️ Leaving the Desert 🏜️ "
-    };
+    // Use Paragraph's built-in alignment to center the content
+    let animation_widget = Paragraph::new(text_lines)
+        .style(Style::default().bg(Color::Black))
+        .alignment(ratatui::layout::Alignment::Center);
     
-    let animation_paragraph = Paragraph::new(lines)
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(if progress > 0.5 { Color::Green } else { Color::Yellow }))
-            .title(title)
-            .style(Style::default().bg(Color::Rgb(0, 0, 0))));
-    
-    f.render_widget(animation_paragraph, area);
+    f.render_widget(animation_widget, area);
 }
 
 pub fn run_ui(mut app: App) -> Result<App> {
@@ -1816,6 +1669,22 @@ fn run_app<B: ratatui::backend::Backend>(
                         render_profiles(f, app, main_chunks[1]);
                     }
                 }
+                
+                // Render simple animations on top (but not profile switch - that's handled in render_profiles)
+                if app.animations_enabled && app.animation_engine.is_active() && !app.profile_switching {
+                    if let Some(frame_content) = app.animation_engine.get_current_frame() {
+                        // Create a small overlay for lock/unlock animations
+                        let overlay_height = 5;
+                        let overlay_width = 20;
+                        let overlay_area = Rect {
+                            x: chunks[1].x + chunks[1].width / 2 - overlay_width / 2,
+                            y: chunks[1].y + chunks[1].height / 2 - overlay_height / 2,
+                            width: overlay_width,
+                            height: overlay_height,
+                        };
+                        render_animation_frame(f, overlay_area, &frame_content);
+                    }
+                }
             }
         })?;
 
@@ -1975,7 +1844,10 @@ fn run_app<B: ratatui::backend::Backend>(
                                     match key.code {
                                         KeyCode::Up => app.move_profile_up(),
                                         KeyCode::Down => app.move_profile_down(),
-                                        KeyCode::Enter => app.load_selected_profile(),
+                                        KeyCode::Enter => {
+                                            log_debug!("UI: Enter key pressed in profiles tab");
+                                            app.load_selected_profile();
+                                        }
                                         KeyCode::Char('s') => {
                                             app.profile_action = ProfileAction::Save;
                                             app.profile_input_mode = true;
