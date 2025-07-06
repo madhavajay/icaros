@@ -75,3 +75,39 @@ fn print_tree_state(node: &file_tree::TreeNode, indent: usize) {
         print_tree_state(child, indent + 1);
     }
 }
+
+#[test]
+fn test_yaml_serialization() {
+    let temp_dir = TempDir::new().unwrap();
+    let root = temp_dir.path();
+    
+    // Create a test state
+    let mut state = state::AppState::new(root.to_path_buf());
+    state.locked_patterns = vec!["**".to_string()];
+    state.unlocked_patterns = vec!["tests/**".to_string()];
+    state.allow_create_patterns = vec![];
+    state.expanded_dirs = vec![root.to_path_buf()];
+    
+    // Save to YAML
+    let state_file = root.join(".icaros");
+    state.save_to_file(&state_file).unwrap();
+    
+    // Read the file content and verify it's YAML
+    let content = fs::read_to_string(&state_file).unwrap();
+    println!("Generated YAML content:\n{}", content);
+    
+    // Verify it contains YAML syntax (no JSON braces at start of lines)
+    assert!(!content.starts_with("{"), "Content should not start with JSON brace");
+    assert!(!content.ends_with("}"), "Content should not end with JSON brace");
+    assert!(content.contains("root_path:"), "Should contain YAML key-value pairs");
+    assert!(content.contains("locked_patterns:"), "Should contain locked_patterns key");
+    assert!(content.contains("- '**'"), "Should contain YAML list items");
+    
+    // Load it back and verify
+    let loaded_state = state::AppState::load_from_file(&state_file).unwrap();
+    assert_eq!(loaded_state.root_path, state.root_path);
+    assert_eq!(loaded_state.locked_patterns, state.locked_patterns);
+    assert_eq!(loaded_state.unlocked_patterns, state.unlocked_patterns);
+    assert_eq!(loaded_state.allow_create_patterns, state.allow_create_patterns);
+    assert_eq!(loaded_state.expanded_dirs, state.expanded_dirs);
+}
