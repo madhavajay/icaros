@@ -17,6 +17,9 @@ dirs = "5.0"
 git2 = "0.18"
 chrono = "0.4.41"
 rand = "0.8"
+strip-ansi-escapes = "0.2"
+image = "0.25"
+ratatui-image = "1.0"
 
 [dev-dependencies]
 tempfile = "3.8"

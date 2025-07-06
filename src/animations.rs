@@ -18,6 +18,8 @@ pub struct Frame {
     pub text: Option<String>,
     #[serde(default)]
     pub file: Option<String>,
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +104,17 @@ impl AnimationEngine {
             }
             
             if let Some(frame) = current_frame {
+                // Load image using viu if specified
+                if let Some(ref image_path) = frame.image {
+                    log_debug!("ANIMATION: Loading image from file: {}", image_path);
+                    if let Ok(ansi_output) = render_image_to_ansi(image_path) {
+                        log_debug!("ANIMATION: Image marker created: {}", &ansi_output);
+                        return Some(ansi_output);
+                    } else {
+                        log_debug!("ANIMATION: ERROR - Failed to render image: {}", image_path);
+                    }
+                }
+                
                 // Load from file if specified
                 if let Some(ref file_path) = frame.file {
                     log_debug!("ANIMATION: Loading frame from file: {}", file_path);
@@ -117,7 +130,7 @@ impl AnimationEngine {
                     log_debug!("ANIMATION: Using text frame ({} chars)", text.len());
                     return Some(text.clone());
                 } else {
-                    log_debug!("ANIMATION: ERROR - Frame has no text or file");
+                    log_debug!("ANIMATION: ERROR - Frame has no text, file, or image");
                 }
             } else {
                 log_debug!("ANIMATION: No frame found for elapsed time {}ms", elapsed);
@@ -134,8 +147,25 @@ impl AnimationEngine {
             false
         }
     }
+    
+    pub fn update(&mut self) {
+        // Clear expired animations
+        if let Some(ref active) = self.active_animation {
+            let elapsed = active.start_time.elapsed().as_millis() as u64;
+            if elapsed > active.spell.duration_ms {
+                log_debug!("ANIMATION: Animation expired, clearing");
+                self.active_animation = None;
+            }
+        }
+    }
 
     pub fn clear(&mut self) {
         self.active_animation = None;
     }
 }
+
+fn render_image_to_ansi(image_path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    // Return a marker that indicates this is an image to be rendered with ratatui-image
+    Ok(format!("IMAGE:{}", image_path))
+}
+

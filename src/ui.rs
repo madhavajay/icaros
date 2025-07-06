@@ -65,6 +65,10 @@ pub struct App {
     pub animation_engine: AnimationEngine,
     // Delayed profile switch
     pub pending_profile_switch: Option<String>,
+    // Image to display
+    pub current_image_path: Option<String>,
+    // Stateful image protocol for better rendering
+    pub image_state: Option<Box<dyn ratatui_image::protocol::Protocol>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -174,6 +178,8 @@ impl App {
             profile_switching: false,
             animation_engine: AnimationEngine::new(),
             pending_profile_switch: None,
+            current_image_path: None,
+            image_state: None,
         };
         app.update_items();
         app.list_state.select(Some(0));
@@ -1347,11 +1353,22 @@ fn render_profiles(
     if app.profile_switching {
         log_debug!("RENDER: Profile switching active, checking for animation frame");
         if let Some(frame_content) = app.animation_engine.get_current_frame() {
-            log_debug!("RENDER: Got frame content, rendering animation");
-            render_animation_frame(f, area, &frame_content);
+            log_debug!("RENDER: Got frame content (first 50 chars): {}", &frame_content.chars().take(50).collect::<String>());
+            
+            // Check if this is an image marker
+            if frame_content.starts_with("IMAGE:") {
+                let image_path = frame_content.trim_start_matches("IMAGE:");
+                log_debug!("RENDER: Detected image frame, path: {}", image_path);
+                app.current_image_path = Some(image_path.to_string());
+                render_image_frame(f, area, image_path);
+            } else {
+                app.current_image_path = None;
+                render_animation_frame(f, area, &frame_content);
+            }
             return;
         } else {
             log_debug!("RENDER: No frame content available");
+            app.current_image_path = None;
         }
     }
     
@@ -1446,22 +1463,99 @@ fn render_animation_frame(
         .style(Style::default().bg(Color::Black));
     f.render_widget(clear_widget, area);
     
-    // Split content into lines
-    let lines: Vec<&str> = content.lines().collect();
+    // For regular ASCII art
+    let cleaned = content
+        .trim_start_matches("\x1b[?25l")  // Remove cursor hide
+        .trim_end_matches("\x1b[?25h")     // Remove cursor show
+        .trim_end_matches("\x1b[0m");      // Remove reset
     
-    // Create the paragraph with all lines
-    let mut text_lines = Vec::new();
-    for line in &lines {
-        text_lines.push(Line::from(Span::styled(*line, Style::default().fg(Color::Cyan))));
-    }
+    // Split into lines and render with basic color
+    let lines: Vec<Line> = cleaned.lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            // For ANSI art, use green theme
+            if line.contains("\x1b[") {
+                // This has ANSI codes - for now just strip them and show in green
+                let stripped = strip_ansi_escapes::strip(line);
+                let text = String::from_utf8_lossy(&stripped);
+                Line::from(Span::styled(text.to_string(), Style::default().fg(Color::Green)))
+            } else {
+                // Plain text - show in cyan
+                Line::from(Span::styled(line, Style::default().fg(Color::Cyan)))
+            }
+        })
+        .collect();
     
-    // Use Paragraph's built-in alignment to center the content
-    let animation_widget = Paragraph::new(text_lines)
+    let animation_widget = Paragraph::new(lines)
         .style(Style::default().bg(Color::Black))
         .alignment(ratatui::layout::Alignment::Center);
     
     f.render_widget(animation_widget, area);
 }
+
+fn render_image_frame(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    image_path: &str,
+) {
+    use ratatui_image::{picker::Picker, Image};
+    
+    // Clear the entire area first
+    let clear_widget = Block::default()
+        .style(Style::default().bg(Color::Black));
+    f.render_widget(clear_widget, area);
+    
+    // Use the full area for maximum size
+    let image_area = area;
+    
+    // Try to load and display the image
+    match image::ImageReader::open(image_path) {
+        Ok(reader) => {
+            match reader.decode() {
+                Ok(dyn_img) => {
+                    // Force using a very small block size for maximum resolution
+                    // This gives us 2x2 pixels per character with unicode blocks
+                    let mut picker = Picker::new((1, 2));
+                    
+                    // Create the protocol
+                    match picker.new_protocol(dyn_img, image_area, ratatui_image::Resize::Fit(None)) {
+                        Ok(protocol) => {
+                            // Create and render the image widget
+                            let image = Image::new(&*protocol);
+                            f.render_widget(image, image_area);
+                        }
+                        Err(e) => {
+                            log_debug!("Failed to create protocol: {}", e);
+                            show_image_error(f, area, &format!("Failed to create protocol: {}", e));
+                        }
+                    }
+                }
+                Err(e) => {
+                    log_debug!("Failed to decode image {}: {}", image_path, e);
+                    show_image_error(f, area, &format!("Failed to decode image: {}", e));
+                }
+            }
+        }
+        Err(e) => {
+            log_debug!("Failed to open image {}: {}", image_path, e);
+            show_image_error(f, area, &format!("Failed to open image: {}", e));
+        }
+    }
+}
+
+fn show_image_error(f: &mut ratatui::Frame, area: Rect, error: &str) {
+    let error_msg = vec![
+        Line::from(""),
+        Line::from(Span::styled("Image Error", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(Span::styled(error, Style::default().fg(Color::Gray))),
+    ];
+    let error_widget = Paragraph::new(error_msg)
+        .style(Style::default().bg(Color::Black))
+        .alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(error_widget, area);
+}
+
 
 pub fn run_ui(mut app: App) -> Result<App> {
     enable_raw_mode()?;
@@ -1546,6 +1640,8 @@ fn run_app<B: ratatui::backend::Backend>(
             if app.animations_enabled {
                 app.frame_count += 1;
                 app.update_animations(f.size().width);
+                // Update animation engine to clear expired animations
+                app.animation_engine.update();
             }
             
             // Update profile animation if active
@@ -1673,9 +1769,9 @@ fn run_app<B: ratatui::backend::Backend>(
                 // Render simple animations on top (but not profile switch - that's handled in render_profiles)
                 if app.animations_enabled && app.animation_engine.is_active() && !app.profile_switching {
                     if let Some(frame_content) = app.animation_engine.get_current_frame() {
-                        // Create a small overlay for lock/unlock animations
-                        let overlay_height = 5;
-                        let overlay_width = 20;
+                        // Create a larger overlay that covers most of the content area
+                        let overlay_height = std::cmp::min(20, chunks[1].height);
+                        let overlay_width = std::cmp::min(50, chunks[1].width);
                         let overlay_area = Rect {
                             x: chunks[1].x + chunks[1].width / 2 - overlay_width / 2,
                             y: chunks[1].y + chunks[1].height / 2 - overlay_height / 2,
@@ -1687,6 +1783,7 @@ fn run_app<B: ratatui::backend::Backend>(
                 }
             }
         })?;
+        
 
         // Check for file system events (non-blocking)
         if fs_events.try_recv().is_ok() {
