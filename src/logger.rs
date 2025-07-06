@@ -1,11 +1,11 @@
+use chrono::Utc;
 use std::fs::OpenOptions;
 use std::io::Write;
-use chrono::Utc;
 
 pub fn log_to_file(message: &str) {
     let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
     let log_message = format!("[{}] {}\n", timestamp, message);
-    
+
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)

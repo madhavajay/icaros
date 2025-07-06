@@ -1,27 +1,27 @@
+mod animations;
 mod file_tree;
+mod git;
+mod logger;
 mod state;
 mod ui;
-mod git;
-mod animations;
-mod logger;
 
-use clap::{Parser, Subcommand};
-use std::path::{Path, PathBuf};
-use std::fs;
 use anyhow::Result;
+use clap::{Parser, Subcommand};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[command(subcommand)]
     command: Option<Commands>,
-    
+
     #[arg(default_value = ".")]
     path: PathBuf,
-    
+
     #[arg(short, long, help = "Path to state file")]
     state_file: Option<PathBuf>,
-    
+
     #[arg(short, long, help = "Additional ignore patterns")]
     ignore: Vec<String>,
 }
@@ -36,9 +36,9 @@ enum Commands {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    
+
     let root_path = args.path.canonicalize()?;
-    
+
     match args.command {
         Some(Commands::Init) => {
             init_command(&root_path)?;
@@ -49,10 +49,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         None => {
-            let state_file = args.state_file.unwrap_or_else(|| {
-                root_path.join(".icaros")
-            });
-            
+            let state_file = args.state_file.unwrap_or_else(|| root_path.join(".icaros"));
+
             // Load ignore patterns from state file, or use defaults plus CLI args
             let mut ignore_patterns = if state_file.exists() {
                 if let Ok(state) = state::AppState::load_from_file(&state_file) {
@@ -63,25 +61,25 @@ fn main() -> Result<()> {
             } else {
                 state::default_ignore_patterns()
             };
-            
+
             // Add CLI ignore patterns
             ignore_patterns.extend(args.ignore);
-            
+
             let tree = file_tree::build_tree(&root_path, &ignore_patterns, false)?;
-            
+
             let mut app = ui::App::new(tree, state_file.clone(), root_path.clone());
-            
+
             if state_file.exists() {
                 if let Ok(state) = state::AppState::load_from_file(&state_file) {
                     restore_state(&mut app, &state);
                 }
             }
-            
+
             let final_app = ui::run_ui(app)?;
-            
+
             println!("\nState file: {}", state_file.display());
             println!("Locked files: {}", final_app.get_locked_files().len());
-            
+
             Ok(())
         }
     }
@@ -89,12 +87,11 @@ fn main() -> Result<()> {
 
 fn show_ignore_command(root_path: &Path, args: &Args) -> Result<()> {
     let default_state_file = root_path.join(".icaros");
-    let state_file = args.state_file.as_ref()
-        .unwrap_or(&default_state_file);
-    
+    let state_file = args.state_file.as_ref().unwrap_or(&default_state_file);
+
     println!("Ignore patterns for: {}", root_path.display());
     println!();
-    
+
     // Load patterns from state file or use defaults
     let ignore_patterns = if state_file.exists() {
         if let Ok(state) = state::AppState::load_from_file(state_file) {
@@ -108,27 +105,48 @@ fn show_ignore_command(root_path: &Path, args: &Args) -> Result<()> {
         println!("Source: defaults (no .icaros file found)");
         state::default_ignore_patterns()
     };
-    
+
     // Add CLI patterns if any
     let mut all_patterns = ignore_patterns;
     if !args.ignore.is_empty() {
-        println!("CLI override patterns: {} additional patterns", args.ignore.len());
+        println!(
+            "CLI override patterns: {} additional patterns",
+            args.ignore.len()
+        );
         all_patterns.extend(args.ignore.clone());
     }
-    
+
     println!();
     println!("Active ignore patterns ({} total):", all_patterns.len());
     for (i, pattern) in all_patterns.iter().enumerate() {
         println!("  {}: {}", i + 1, pattern);
     }
-    
+
     println!();
     println!("Pattern types:");
-    println!("  Directories: {} (end with /)", all_patterns.iter().filter(|p| p.ends_with('/')).count());
-    println!("  Extensions:  {} (start with *.)", all_patterns.iter().filter(|p| p.starts_with("*.")).count());
-    println!("  Files:       {} (exact matches)", all_patterns.iter().filter(|p| !p.ends_with('/') && !p.starts_with("*.") && !p.contains('*')).count());
-    println!("  Patterns:    {} (contain wildcards)", all_patterns.iter().filter(|p| p.contains('*') && !p.starts_with("*.")).count());
-    
+    println!(
+        "  Directories: {} (end with /)",
+        all_patterns.iter().filter(|p| p.ends_with('/')).count()
+    );
+    println!(
+        "  Extensions:  {} (start with *.)",
+        all_patterns.iter().filter(|p| p.starts_with("*.")).count()
+    );
+    println!(
+        "  Files:       {} (exact matches)",
+        all_patterns
+            .iter()
+            .filter(|p| !p.ends_with('/') && !p.starts_with("*.") && !p.contains('*'))
+            .count()
+    );
+    println!(
+        "  Patterns:    {} (contain wildcards)",
+        all_patterns
+            .iter()
+            .filter(|p| p.contains('*') && !p.starts_with("*."))
+            .count()
+    );
+
     Ok(())
 }
 
@@ -136,12 +154,12 @@ fn restore_state(app: &mut ui::App, state: &state::AppState) {
     eprintln!("Restoring state...");
     eprintln!("  locked_patterns: {:?}", state.locked_patterns);
     eprintln!("  unlocked_patterns: {:?}", state.unlocked_patterns);
-    
+
     // First restore expanded dirs
     for expanded_dir in &state.expanded_dirs {
         restore_expanded(&mut app.tree, expanded_dir);
     }
-    
+
     // Apply locked patterns and track explicitly locked paths
     app.explicitly_locked_paths.clear();
     for pattern in &state.locked_patterns {
@@ -153,29 +171,32 @@ fn restore_state(app: &mut ui::App, state: &state::AppState) {
             app.explicitly_locked_paths.push(path);
         }
     }
-    
+
     // Then apply unlocked patterns (exceptions to locked patterns)
     app.explicitly_unlocked_paths.clear();
     for pattern in &state.unlocked_patterns {
         if let Some(path) = pattern_to_path(&state.root_path, pattern) {
-            eprintln!("  Explicit unlock path: {:?} from pattern: {}", path, pattern);
+            eprintln!(
+                "  Explicit unlock path: {:?} from pattern: {}",
+                path, pattern
+            );
             app.explicitly_unlocked_paths.push(path);
         }
     }
-    
+
     // Finally restore allow_create patterns
     for pattern in &state.allow_create_patterns {
         if let Some(path) = pattern_to_path(&state.root_path, pattern) {
             restore_allow_create(&mut app.tree, &path);
         }
     }
-    
+
     // Clean up any conflicts or duplicates
     app.cleanup_lock_lists();
-    
+
     // Apply the explicit locks to the tree
     app.reapply_explicit_locks();
-    
+
     app.update_items();
     eprintln!("State restoration complete.");
 }
@@ -203,7 +224,7 @@ fn restore_expanded(node: &mut file_tree::TreeNode, path: &Path) -> bool {
         node.is_expanded = true;
         return true;
     }
-    
+
     for child in &mut node.children {
         if restore_expanded(child, path) {
             return true;
@@ -227,7 +248,7 @@ fn restore_locked(node: &mut file_tree::TreeNode, path: &Path) -> bool {
         // Also don't call lock_all_children as it resets allow_create_in_locked flags
         return true;
     }
-    
+
     for child in &mut node.children {
         restore_locked(child, path);
     }
@@ -244,7 +265,7 @@ fn restore_unlocked(node: &mut file_tree::TreeNode, path: &Path) -> bool {
         }
         return true;
     }
-    
+
     for child in &mut node.children {
         restore_unlocked(child, path);
     }
@@ -264,7 +285,7 @@ fn restore_allow_create(node: &mut file_tree::TreeNode, path: &Path) -> bool {
         node.allow_create_in_locked = true;
         return true;
     }
-    
+
     for child in &mut node.children {
         if restore_allow_create(child, path) {
             return true;
@@ -276,31 +297,31 @@ fn restore_allow_create(node: &mut file_tree::TreeNode, path: &Path) -> bool {
 fn init_command(root_path: &Path) -> Result<()> {
     let claude_md_path = root_path.join("CLAUDE.md");
     let icaros_md_path = root_path.join("ICAROS.md");
-    
+
     // Load templates from embedded files or from prompts directory
     let icaros_content = load_template("ICAROS.md")?;
-    
+
     // Write ICAROS.md
     fs::write(&icaros_md_path, icaros_content)?;
     println!("Created ICAROS.md with file lock system instructions");
-    
+
     // Check if CLAUDE.md exists
     if claude_md_path.exists() {
         // Read existing content
         let claude_content = fs::read_to_string(&claude_md_path)?;
-        
+
         // Check if it already references ICAROS.md
         if !claude_content.contains("ICAROS.md") {
             // Load update template
             let update_template = load_template("CLAUDE_UPDATE.md")?;
-            
+
             // Remove any existing CLAUDE.md header variations
             let existing_content = claude_content
                 .trim_start_matches("# CLAUDE.md - Project-Specific Instructions for Claude")
                 .trim_start_matches("# CLAUDE.md - My Existing Instructions")
                 .trim_start_matches("# CLAUDE.md")
                 .trim_start();
-            
+
             let updated_content = update_template.replace("{existing_content}", existing_content);
             fs::write(&claude_md_path, updated_content)?;
             println!("Updated CLAUDE.md to reference ICAROS.md");
@@ -313,7 +334,7 @@ fn init_command(root_path: &Path) -> Result<()> {
         fs::write(&claude_md_path, claude_content)?;
         println!("Created CLAUDE.md with reference to ICAROS.md");
     }
-    
+
     Ok(())
 }
 
@@ -326,14 +347,14 @@ fn load_template(filename: &str) -> Result<String> {
                 .map_err(|e| anyhow::anyhow!("Failed to read user template: {}", e));
         }
     }
-    
+
     // Then try from application's prompts directory
     let app_template = PathBuf::from("prompts").join(filename);
     if app_template.exists() {
         return fs::read_to_string(app_template)
             .map_err(|e| anyhow::anyhow!("Failed to read app template: {}", e));
     }
-    
+
     // Finally, use the embedded defaults
     let content = match filename {
         "ICAROS.md" => include_str!("../prompts/ICAROS.md"),
@@ -341,6 +362,6 @@ fn load_template(filename: &str) -> Result<String> {
         "CLAUDE_UPDATE.md" => include_str!("../prompts/CLAUDE_UPDATE.md"),
         _ => return Err(anyhow::anyhow!("Unknown template: {}", filename)),
     };
-    
+
     Ok(content.to_string())
 }
