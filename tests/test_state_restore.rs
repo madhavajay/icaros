@@ -95,7 +95,7 @@ fn test_yaml_serialization() {
 
     // Read the file content and verify it's YAML
     let content = fs::read_to_string(&state_file).unwrap();
-    println!("Generated YAML content:\n{}", content);
+    println!("Generated YAML content:\n{content}");
 
     // Verify it contains YAML syntax (no JSON braces at start of lines)
     assert!(

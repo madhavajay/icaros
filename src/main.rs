@@ -121,7 +121,7 @@ fn show_ignore_command(root_path: &Path, args: &Args) -> Result<()> {
     println!();
     println!("Active ignore patterns ({} total):", all_patterns.len());
     for (i, pattern) in all_patterns.iter().enumerate() {
-        println!("  {}: {}", i + 1, pattern);
+        println!("  {}: {pattern}", i + 1);
     }
 
     println!();
@@ -154,8 +154,8 @@ fn show_ignore_command(root_path: &Path, args: &Args) -> Result<()> {
 
 fn restore_state(app: &mut ui::App, state: &state::AppState) {
     eprintln!("Restoring state...");
-    eprintln!("  locked_patterns: {:?}", state.locked_patterns);
-    eprintln!("  unlocked_patterns: {:?}", state.unlocked_patterns);
+    eprintln!("  locked_patterns: {}", state.locked_patterns.join(", "));
+    eprintln!("  unlocked_patterns: {}", state.unlocked_patterns.join(", "));
 
     // First restore expanded dirs
     for expanded_dir in &state.expanded_dirs {
@@ -166,10 +166,10 @@ fn restore_state(app: &mut ui::App, state: &state::AppState) {
     app.explicitly_locked_paths.clear();
     for pattern in &state.locked_patterns {
         if pattern == "**" {
-            eprintln!("  Locking entire tree with pattern: {}", pattern);
+            eprintln!("  Locking entire tree with pattern: {pattern}");
             app.explicitly_locked_paths.push(state.root_path.clone());
         } else if let Some(path) = pattern_to_path(&state.root_path, pattern) {
-            eprintln!("  Locking path: {:?} from pattern: {}", path, pattern);
+            eprintln!("  Locking path: {path:?} from pattern: {pattern}");
             app.explicitly_locked_paths.push(path);
         }
     }
@@ -178,10 +178,7 @@ fn restore_state(app: &mut ui::App, state: &state::AppState) {
     app.explicitly_unlocked_paths.clear();
     for pattern in &state.unlocked_patterns {
         if let Some(path) = pattern_to_path(&state.root_path, pattern) {
-            eprintln!(
-                "  Explicit unlock path: {:?} from pattern: {}",
-                path, pattern
-            );
+            eprintln!("  Explicit unlock path: {path:?} from pattern: {pattern}");
             app.explicitly_unlocked_paths.push(path);
         }
     }

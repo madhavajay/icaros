@@ -4,7 +4,7 @@ use std::io::Write;
 
 pub fn log_to_file(message: &str) {
     let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
-    let log_message = format!("[{}] {}\n", timestamp, message);
+    let log_message = format!("[{timestamp}] {message}\n");
 
     if let Ok(mut file) = OpenOptions::new()
         .create(true)

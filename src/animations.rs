@@ -276,5 +276,5 @@ impl AnimationEngine {
 
 fn render_image_to_ansi(image_path: &str) -> Result<String, Box<dyn std::error::Error>> {
     // Return a marker that indicates this is an image to be rendered with ratatui-image
-    Ok(format!("IMAGE:{}", image_path))
+    Ok(format!("IMAGE:{image_path}"))
 }

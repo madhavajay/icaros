@@ -94,7 +94,7 @@ pub fn build_tree(
             Ok(e) => e,
             Err(err) => {
                 // Log the error but continue processing other files
-                eprintln!("Warning: Skipping entry due to IO error: {}", err);
+                eprintln!("Warning: Skipping entry due to IO error: {err}");
                 continue;
             }
         };
@@ -166,7 +166,7 @@ fn should_ignore(path: &Path, patterns: &[String], show_hidden: bool) -> bool {
             }
         } else if pattern.ends_with('/') {
             // Directory pattern - check if path contains this directory
-            if path_str.contains(&format!("/{}", pattern)) || path_str.contains(pattern) {
+            if path_str.contains(&format!("/{pattern}")) || path_str.contains(pattern) {
                 return true;
             }
         } else {

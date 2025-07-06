@@ -189,7 +189,7 @@ impl App {
         log_debug!("UI: Loading animation spells");
         if let Err(e) = app.animation_engine.load_spells() {
             log_debug!("UI: ERROR - Failed to load animation spells: {}", e);
-            eprintln!("Warning: Failed to load animation spells: {}", e);
+            eprintln!("Warning: Failed to load animation spells: {e}");
         } else {
             log_debug!("UI: Animation spells loaded successfully");
         }
@@ -244,7 +244,7 @@ impl App {
             let was_locked = self.is_path_effectively_locked(&path);
 
             if std::env::var("ICAROS_DEBUG").is_ok() {
-                eprintln!("Toggle: {:?}, was_locked: {}", path, was_locked);
+                eprintln!("Toggle: {path:?}, was_locked: {was_locked}");
                 eprintln!("  Explicitly locked: {:?}", self.explicitly_locked_paths);
                 eprintln!(
                     "  Explicitly unlocked: {:?}",
@@ -516,8 +516,8 @@ impl App {
 
         if std::env::var("ICAROS_DEBUG").is_ok() {
             eprintln!("Saving patterns:");
-            eprintln!("  Locked: {:?}", locked_vec);
-            eprintln!("  Unlocked: {:?}", unlocked_vec);
+            eprintln!("  Locked: {locked_vec:?}");
+            eprintln!("  Unlocked: {unlocked_vec:?}");
         }
 
         if std::env::var("ICAROS_DEBUG").is_ok() {
@@ -529,7 +529,7 @@ impl App {
         }
 
         if let Err(e) = state.save_to_file(&self.state_file) {
-            eprintln!("Error saving state: {}", e);
+            eprintln!("Error saving state: {e}");
         }
     }
 
