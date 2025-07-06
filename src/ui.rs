@@ -1542,50 +1542,55 @@ fn render_image_frame(
     // Use the full area for maximum size
     let image_area = area;
     
-    // Try to load and display the image
-    match image::ImageReader::open(image_path) {
-        Ok(reader) => {
-            match reader.decode() {
-                Ok(dyn_img) => {
-                    // Force using a very small block size for maximum resolution
-                    // This gives us 2x2 pixels per character with unicode blocks
-                    let mut picker = Picker::new((1, 2));
-                    
-                    // Calculate dimensions to make image width = 100% of panel width
-                    let img_width = dyn_img.width() as f64;
-                    let img_height = dyn_img.height() as f64;
-                    let panel_width = image_area.width as f64;
-                    
-                    // Scale based on width to fill 100% of panel width
-                    let width_scale = panel_width / img_width;
-                    let new_width = panel_width as u32;
-                    let new_height = (img_height * width_scale) as u32;
-                    
-                    // Resize the image to exactly match panel width
-                    let resized_img = dyn_img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
-                    
-                    // Use the resized image with Fit mode
-                    match picker.new_protocol(resized_img, image_area, ratatui_image::Resize::Fit(None)) {
-                        Ok(protocol) => {
-                            // Create and render the image widget
-                            let image = Image::new(&*protocol);
-                            f.render_widget(image, image_area);
-                        }
-                        Err(e) => {
-                            log_debug!("Failed to create protocol: {}", e);
-                            show_image_error(f, area, &format!("Failed to create protocol: {}", e));
-                        }
-                    }
+    // Try to load and display the image (embedded first, then filesystem)
+    let image_result = if let Some(embedded_bytes) = crate::animations::get_embedded_image(image_path) {
+        log_debug!("Using embedded image for: {}", image_path);
+        image::ImageReader::new(std::io::Cursor::new(embedded_bytes))
+            .with_guessed_format()
+            .map_err(|e| format!("Failed to create reader: {}", e))
+            .and_then(|reader| reader.decode().map_err(|e| format!("Failed to decode: {}", e)))
+    } else {
+        log_debug!("Using filesystem image for: {}", image_path);
+        image::ImageReader::open(image_path)
+            .map_err(|e| format!("Failed to open: {}", e))
+            .and_then(|reader| reader.decode().map_err(|e| format!("Failed to decode: {}", e)))
+    };
+    
+    match image_result {
+        Ok(dyn_img) => {
+            // Force using a very small block size for maximum resolution
+            // This gives us 2x2 pixels per character with unicode blocks
+            let mut picker = Picker::new((1, 2));
+            
+            // Calculate dimensions to make image width = 100% of panel width
+            let img_width = dyn_img.width() as f64;
+            let img_height = dyn_img.height() as f64;
+            let panel_width = image_area.width as f64;
+            
+            // Scale based on width to fill 100% of panel width
+            let width_scale = panel_width / img_width;
+            let new_width = panel_width as u32;
+            let new_height = (img_height * width_scale) as u32;
+            
+            // Resize the image to exactly match panel width
+            let resized_img = dyn_img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
+            
+            // Use the resized image with Fit mode
+            match picker.new_protocol(resized_img, image_area, ratatui_image::Resize::Fit(None)) {
+                Ok(protocol) => {
+                    // Create and render the image widget
+                    let image = Image::new(&*protocol);
+                    f.render_widget(image, image_area);
                 }
                 Err(e) => {
-                    log_debug!("Failed to decode image {}: {}", image_path, e);
-                    show_image_error(f, area, &format!("Failed to decode image: {}", e));
+                    log_debug!("Failed to create protocol: {}", e);
+                    show_image_error(f, area, &format!("Failed to create protocol: {}", e));
                 }
             }
         }
         Err(e) => {
-            log_debug!("Failed to open image {}: {}", image_path, e);
-            show_image_error(f, area, &format!("Failed to open image: {}", e));
+            log_debug!("Failed to load image {}: {}", image_path, e);
+            show_image_error(f, area, &e);
         }
     }
 }
@@ -1710,7 +1715,7 @@ fn run_app<B: ratatui::backend::Backend>(
             // Update animations
             if app.animations_enabled {
                 app.frame_count += 1;
-                app.update_animations(f.size().width);
+                app.update_animations(f.area().width);
                 // Update animation engine to clear expired animations
                 app.animation_engine.update();
             }
@@ -1726,7 +1731,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     Constraint::Length(3),  // Top title bar
                     Constraint::Min(0),     // Main content area
                 ].as_ref())
-                .split(f.size());
+                .split(f.area());
 
             // Create animated title with gradient background
             let mut title_spans = Vec::new();

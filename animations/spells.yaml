@@ -8,7 +8,7 @@ profile_switch:
       image: "art/jungle.jpg"
     - frame: 0
       overlay: true
-      blink_rate_ms: 100
+      blink_rate_ms: 200
       text: |
         ███████╗██╗    ██╗██╗████████╗ ██████╗██╗  ██╗
         ██╔════╝██║    ██║██║╚══██╔══╝██╔════╝██║  ██║

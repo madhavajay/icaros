@@ -4,6 +4,16 @@ use serde::{Deserialize, Serialize};
 use anyhow::{Result, Context};
 use crate::log_debug;
 
+// Embed image resources
+const JUNGLE_IMAGE: &[u8] = include_bytes!("../art/jungle.jpg");
+
+pub fn get_embedded_image(path: &str) -> Option<&'static [u8]> {
+    match path {
+        "art/jungle.jpg" => Some(JUNGLE_IMAGE),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Spell {
     pub trigger: String,
@@ -53,8 +63,17 @@ impl AnimationEngine {
     pub fn load_spells(&mut self) -> Result<()> {
         log_debug!("ANIMATION: Starting to load spells from animations/spells.yaml");
         
-        let content = std::fs::read_to_string("animations/spells.yaml")
-            .context("Failed to read spells.yaml")?;
+        // Try to load from filesystem first, fallback to embedded
+        let content = match std::fs::read_to_string("animations/spells.yaml") {
+            Ok(content) => {
+                log_debug!("ANIMATION: Loaded spells from filesystem");
+                content
+            }
+            Err(_) => {
+                log_debug!("ANIMATION: Loading spells from embedded resources");
+                include_str!("../animations/spells.yaml").to_string()
+            }
+        };
         
         log_debug!("ANIMATION: Read {} bytes from spells.yaml", content.len());
         
@@ -113,11 +132,19 @@ impl AnimationEngine {
                 // Load image using viu if specified
                 if let Some(ref image_path) = frame.image {
                     log_debug!("ANIMATION: Loading image from file: {}", image_path);
-                    if let Ok(ansi_output) = render_image_to_ansi(image_path) {
-                        log_debug!("ANIMATION: Image marker created: {}", &ansi_output);
-                        return Some(ansi_output);
+                    // Check if we have embedded version or if file exists
+                    let has_embedded = get_embedded_image(image_path).is_some();
+                    let file_exists = std::path::Path::new(image_path).exists();
+                    
+                    if has_embedded || file_exists {
+                        if let Ok(ansi_output) = render_image_to_ansi(image_path) {
+                            log_debug!("ANIMATION: Image marker created: {}", &ansi_output);
+                            return Some(ansi_output);
+                        } else {
+                            log_debug!("ANIMATION: ERROR - Failed to render image: {}", image_path);
+                        }
                     } else {
-                        log_debug!("ANIMATION: ERROR - Failed to render image: {}", image_path);
+                        log_debug!("ANIMATION: ERROR - Image not found (embedded or filesystem): {}", image_path);
                     }
                 }
                 

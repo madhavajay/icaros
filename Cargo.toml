@@ -9,7 +9,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 walkdir = "2.4"
-ratatui = "0.26"
+ratatui = "0.28"
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"
 notify = "6.1"
@@ -19,7 +19,7 @@ chrono = "0.4.41"
 rand = "0.8"
 strip-ansi-escapes = "0.2"
 image = "0.25"
-ratatui-image = "1.0"
+ratatui-image = "2.0"
 
 [dev-dependencies]
 tempfile = "3.8"
