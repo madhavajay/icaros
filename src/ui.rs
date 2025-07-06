@@ -50,12 +50,45 @@ pub struct App {
     pub git_selected_hunk: usize,
     pub git_pane: GitPane,
     pub show_help: bool,
+    // Profile system
+    pub show_profile_menu: bool,
+    pub profile_list_state: ListState,
+    pub profile_names: Vec<String>,
+    pub active_profile_name: Option<String>,
+    pub profile_input_mode: bool,
+    pub profile_input_buffer: String,
+    pub profile_action: ProfileAction,
+    // Animation system
+    pub animation_state: AnimationState,
+    pub animation_start: Option<Instant>,
+    pub profile_switching: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TabIndex {
     FileGuardian,
     GitStage,
+    Profiles,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProfileAction {
+    None,
+    Save,
+    Load,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnimationState {
+    None,
+    ProfileSwitch {
+        progress: f32,
+        pyramid_scale: f32,
+        llama_offset: f32,
+        cactus_sway: f32,
+        desert_fade: f32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -142,6 +175,16 @@ impl App {
             git_selected_hunk: 0,
             git_pane: GitPane::FileList,
             show_help: false,
+            show_profile_menu: false,
+            profile_list_state: ListState::default(),
+            profile_names: Vec::new(),
+            active_profile_name: None,
+            profile_input_mode: false,
+            profile_input_buffer: String::new(),
+            profile_action: ProfileAction::None,
+            animation_state: AnimationState::None,
+            animation_start: None,
+            profile_switching: false,
         };
         app.update_items();
         app.list_state.select(Some(0));
@@ -386,7 +429,14 @@ impl App {
     }
 
     fn save_state(&self) {
-        let mut state = crate::state::AppState::new(self.root_path.clone());
+        // Load existing state to preserve profiles, or create new one if it doesn't exist
+        let mut state = crate::state::AppState::load_from_file(&self.state_file)
+            .unwrap_or_else(|_| crate::state::AppState::new(self.root_path.clone()));
+        
+        if std::env::var("ICAROS_DEBUG").is_ok() {
+            eprintln!("save_state: loaded {} profiles, active_profile: {:?}", state.profiles.len(), state.active_profile);
+        }
+        
         state.update_expanded_dirs(self.get_expanded_dirs());
         
         // Convert explicit paths to patterns with deduplication
@@ -445,6 +495,10 @@ impl App {
             eprintln!("Saving patterns:");
             eprintln!("  Locked: {:?}", locked_vec);
             eprintln!("  Unlocked: {:?}", unlocked_vec);
+        }
+        
+        if std::env::var("ICAROS_DEBUG").is_ok() {
+            eprintln!("save_state: saving {} profiles, active_profile: {:?}", state.profiles.len(), state.active_profile);
         }
         
         if let Err(e) = state.save_to_file(&self.state_file) {
@@ -670,6 +724,221 @@ impl App {
         self.git_diff_scroll += 1;
     }
     
+    // Profile management methods
+    pub fn load_profiles(&mut self) {
+        if let Ok(state) = crate::state::AppState::load_from_file(&self.state_file) {
+            self.profile_names = state.get_profile_names();
+            self.active_profile_name = state.get_active_profile_name().cloned();
+            if !self.profile_names.is_empty() {
+                self.profile_list_state.select(Some(0));
+            }
+        }
+    }
+    
+    pub fn move_profile_up(&mut self) {
+        if let Some(selected) = self.profile_list_state.selected() {
+            if selected > 0 {
+                self.profile_list_state.select(Some(selected - 1));
+            }
+        }
+    }
+    
+    pub fn move_profile_down(&mut self) {
+        if let Some(selected) = self.profile_list_state.selected() {
+            if selected < self.profile_names.len().saturating_sub(1) {
+                self.profile_list_state.select(Some(selected + 1));
+            }
+        }
+    }
+    
+    pub fn load_selected_profile(&mut self) {
+        if let Some(selected) = self.profile_list_state.selected() {
+            if selected < self.profile_names.len() {
+                let profile_name = self.profile_names[selected].clone();
+                self.start_profile_switch_animation();
+                self.switch_to_profile(&profile_name);
+            }
+        }
+    }
+    
+    pub fn delete_selected_profile(&mut self) {
+        if let Some(selected) = self.profile_list_state.selected() {
+            if selected < self.profile_names.len() {
+                let profile_name = self.profile_names[selected].clone();
+                if let Ok(mut state) = crate::state::AppState::load_from_file(&self.state_file) {
+                    if state.delete_profile(&profile_name) {
+                        let _ = state.save_to_file(&self.state_file);
+                        self.load_profiles();
+                        // Adjust selection
+                        if self.profile_names.is_empty() {
+                            self.profile_list_state.select(None);
+                        } else if selected >= self.profile_names.len() {
+                            self.profile_list_state.select(Some(self.profile_names.len() - 1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    pub fn handle_profile_input(&mut self) {
+        if !self.profile_input_buffer.trim().is_empty() {
+            match self.profile_action {
+                ProfileAction::Save => {
+                    // Load existing state and add the profile
+                    if let Ok(mut state) = crate::state::AppState::load_from_file(&self.state_file) {
+                        let description = format!("Saved on {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"));
+                        
+                        // Get current patterns from UI state, not the loaded file
+                        let current_locked = self.get_current_locked_patterns();
+                        let current_unlocked = self.get_current_unlocked_patterns();
+                        
+                        // Create profile from current UI state
+                        let profile = crate::state::LockProfile {
+                            locked_patterns: current_locked,
+                            unlocked_patterns: current_unlocked,
+                            allow_create_patterns: vec![], // TODO: implement if needed
+                            description,
+                        };
+                        
+                        state.profiles.insert(self.profile_input_buffer.clone(), profile);
+                        state.active_profile = Some(self.profile_input_buffer.clone());
+                        self.active_profile_name = Some(self.profile_input_buffer.clone());
+                        
+                        if std::env::var("ICAROS_DEBUG").is_ok() {
+                            eprintln!("Saving profile '{}' with {} profiles total", self.profile_input_buffer, state.profiles.len());
+                        }
+                        
+                        if let Err(e) = state.save_to_file(&self.state_file) {
+                            eprintln!("Error saving profile: {}", e);
+                        } else if std::env::var("ICAROS_DEBUG").is_ok() {
+                            eprintln!("Profile saved successfully");
+                        }
+                        
+                        self.load_profiles();
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.profile_input_mode = false;
+        self.profile_input_buffer.clear();
+        self.profile_action = ProfileAction::None;
+    }
+    
+    pub fn switch_to_profile(&mut self, name: &str) {
+        if let Ok(mut state) = crate::state::AppState::load_from_file(&self.state_file) {
+            if state.switch_to_profile(name) {
+                let _ = state.save_to_file(&self.state_file);
+                self.active_profile_name = Some(name.to_string());
+                
+                // Apply the new patterns to the tree
+                self.explicitly_locked_paths.clear();
+                self.explicitly_unlocked_paths.clear();
+                
+                // Convert patterns back to paths
+                for pattern in &state.locked_patterns {
+                    if let Some(path) = pattern_to_path(&self.root_path, pattern) {
+                        self.explicitly_locked_paths.push(path);
+                    }
+                }
+                
+                for pattern in &state.unlocked_patterns {
+                    if let Some(path) = pattern_to_path(&self.root_path, pattern) {
+                        self.explicitly_unlocked_paths.push(path);
+                    }
+                }
+                
+                // Reapply locks to the tree
+                self.reapply_explicit_locks();
+                self.update_items();
+            }
+        }
+    }
+    
+    pub fn start_profile_switch_animation(&mut self) {
+        self.animation_state = AnimationState::ProfileSwitch {
+            progress: 0.0,
+            pyramid_scale: 1.0,
+            llama_offset: 0.0,
+            cactus_sway: 0.0,
+            desert_fade: 0.0,
+        };
+        self.animation_start = Some(Instant::now());
+        self.profile_switching = true;
+    }
+    
+    pub fn update_profile_animation(&mut self) {
+        if let Some(start_time) = self.animation_start {
+            let elapsed = start_time.elapsed().as_secs_f32();
+            let progress = (elapsed / 2.0).min(1.0); // 2 second animation
+            
+            if let AnimationState::ProfileSwitch { .. } = &mut self.animation_state {
+                self.animation_state = AnimationState::ProfileSwitch {
+                    progress,
+                    pyramid_scale: 1.0 + (progress * 2.0).sin() * 0.3,
+                    llama_offset: (progress * 8.0).sin() * 10.0,
+                    cactus_sway: (progress * 6.0).sin() * 5.0,
+                    desert_fade: (progress * std::f32::consts::PI).sin(),
+                };
+            }
+            
+            if progress >= 1.0 {
+                self.animation_state = AnimationState::None;
+                self.animation_start = None;
+                self.profile_switching = false;
+            }
+        }
+    }
+    
+    fn get_current_locked_patterns(&self) -> Vec<String> {
+        let mut patterns = Vec::new();
+        
+        // If no explicit locks, check if everything is locked via tree state
+        if self.explicitly_locked_paths.is_empty() {
+            // Check if the root is locked in the tree
+            if self.tree.is_locked {
+                patterns.push("**".to_string());
+            }
+        } else {
+            for path in &self.explicitly_locked_paths {
+                if let Ok(relative) = path.strip_prefix(&self.root_path) {
+                    if relative.as_os_str().is_empty() {
+                        patterns.push("**".to_string());
+                    } else {
+                        let pattern = if path.is_dir() {
+                            format!("{}/**", relative.display())
+                        } else {
+                            relative.display().to_string()
+                        };
+                        patterns.push(pattern);
+                    }
+                }
+            }
+        }
+        
+        patterns.sort();
+        patterns.dedup();
+        patterns
+    }
+    
+    fn get_current_unlocked_patterns(&self) -> Vec<String> {
+        let mut patterns = Vec::new();
+        for path in &self.explicitly_unlocked_paths {
+            if let Ok(relative) = path.strip_prefix(&self.root_path) {
+                let pattern = if path.is_dir() {
+                    format!("{}/**", relative.display())
+                } else {
+                    relative.display().to_string()
+                };
+                patterns.push(pattern);
+            }
+        }
+        patterns.sort();
+        patterns.dedup();
+        patterns
+    }
+    
 }
 
 
@@ -861,6 +1130,19 @@ fn is_pattern_covered(specific: &str, general: &str) -> bool {
     false
 }
 
+fn pattern_to_path(root: &std::path::Path, pattern: &str) -> Option<std::path::PathBuf> {
+    if pattern == "**" {
+        return Some(root.to_path_buf());
+    }
+    
+    if pattern.ends_with("/**") {
+        let dir_pattern = &pattern[..pattern.len() - 3];
+        return Some(root.join(dir_pattern));
+    }
+    
+    Some(root.join(pattern))
+}
+
 fn render_file_guardian(
     f: &mut ratatui::Frame,
     app: &mut App,
@@ -1024,6 +1306,249 @@ fn render_git_stage(
     f.render_widget(diff_widget, chunks[1]);
 }
 
+fn render_profiles(
+    f: &mut ratatui::Frame,
+    app: &mut App,
+    area: Rect,
+) {
+    // Check if profile switching animation is active
+    if let AnimationState::ProfileSwitch {
+        progress,
+        pyramid_scale,
+        llama_offset,
+        cactus_sway,
+        desert_fade,
+    } = app.animation_state
+    {
+        render_profile_switch_animation(f, area, progress, pyramid_scale, llama_offset, cactus_sway, desert_fade);
+        return;
+    }
+    
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(5),     // Profile list
+            Constraint::Length(3),  // Input area (when active)
+        ].as_ref())
+        .split(area);
+    
+    // Profile list
+    let profile_items: Vec<ListItem> = app.profile_names
+        .iter()
+        .enumerate()
+        .map(|(_i, name)| {
+            let mut spans = vec![
+                Span::raw("  "),
+            ];
+            
+            // Active profile indicator
+            if Some(name) == app.active_profile_name.as_ref() {
+                spans.push(Span::styled("● ", Style::default().fg(Color::Green)));
+            } else {
+                spans.push(Span::raw("  "));
+            }
+            
+            spans.push(Span::styled(name, Style::default().fg(Color::Cyan)));
+            
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    
+    let active_profile_text = app.active_profile_name
+        .as_ref()
+        .map(|name| format!(" Active: {} ", name))
+        .unwrap_or_else(|| " No Active Profile ".to_string());
+    
+    let list = List::new(profile_items)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta))
+            .title(format!(" 🏜️ Lock Profiles 🏜️{}", active_profile_text))
+            .style(Style::default().bg(Color::Rgb(0, 0, 0))))
+        .highlight_style(Style::default()
+            .bg(Color::Magenta)
+            .add_modifier(Modifier::BOLD));
+    
+    f.render_stateful_widget(list, chunks[0], &mut app.profile_list_state);
+    
+    // Input area (when in input mode)
+    if app.profile_input_mode {
+        let input_text = match app.profile_action {
+            ProfileAction::Save => format!("Save current profile as: {}", app.profile_input_buffer),
+            _ => app.profile_input_buffer.clone(),
+        };
+        
+        let input_paragraph = Paragraph::new(input_text)
+            .block(Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Enter Profile Name (Enter to save, Esc to cancel) "))
+            .style(Style::default().fg(Color::White));
+        
+        f.render_widget(input_paragraph, chunks[1]);
+    } else {
+        // Help text
+        let help_text = vec![
+            Line::from(vec![
+                Span::raw("Enter: Load | s: Save current | d: Delete | r: Refresh | Up/Down: Navigate")
+            ])
+        ];
+        
+        let help_paragraph = Paragraph::new(help_text)
+            .block(Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Gray))
+                .title(" Commands "))
+            .style(Style::default().fg(Color::Gray));
+        
+        f.render_widget(help_paragraph, chunks[1]);
+    }
+}
+
+fn render_profile_switch_animation(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    progress: f32,
+    pyramid_scale: f32,
+    llama_offset: f32,
+    cactus_sway: f32,
+    desert_fade: f32,
+) {
+    let width = area.width as usize;
+    let height = area.height as usize;
+    
+    // ASCII jungle art from chafa conversion
+    let jungle_art = vec![
+        "▃▉▘▖▁▆▃▝▂▃▘┓▝▄╴▂┊▗╺╸╵▃▉▁▘▂▇▃╱▃╺▅▄▖┊┏▘▄┲▝",
+        "▚▆▃▂▗▝▝▝▏┣▉▃╵▗▗▋▎▄▘▖╺╺╵▍▄┓┲┛▅▝▘▇▍▂▏▚▇▄▃▃",
+        "▄▄▉▆┪╸▗▇▘▝▎┙▉▌▏▋▝┭▃▂▁▃▎▍▖▝▍━┓▖▘▚╾▉▝▂▘┒┖▌",
+        "▅▎▗┓╶▄┓▎▍╻▁┡▉▌┊▋▌┒▁╱▃╵▂▖▝╹▂▍▝▗┊▄▃┙▘▄▗▝▗",
+        "╴▝▊▝▚▏▊▎▝╹▄╾┗┗▖▋▅╾▃▇▆┓┙▗▁╶▝▘▄▋▆╸╻╾▏▍┏▃▚▗",
+        "╺╸╿▋▘▚┛▃▊▍▌▏▋▎▆▃━▂▍▄▆┃┊┑▝▇▅━▄▘▌┃▝▗▘▚▂╵▖┃▘",
+        "│▉▂┃▚▊┣▌▇▘▃▊▎╶▊┗━▂▝▁▗▇▃┻▎▊╻▖▂┃▘▄▘▎",
+        "▋┿▂┃▖▖┑▉▁▁▁╎┦┎╴╽▖▄▍▊╺▚━┑▘▄┙┓▖╱┗┙▁╶▝▘▄▊╺╾┌▍┏▃▚",
+        "┙▊╱╻▍╹▗▅▚▎▃╸╻╾▏▍┏▃▚▗┏┃▖▆╼┏▅▍▁▇▘▚▄▗▋▇▄▊┌▂▃▖",
+        "▁┿▂┃▖▖┑▉▁▁▁╎┦┎╴╽▖▄▍▊╺▚━┑▘▄┙┓▖▀▉╺╾▄▎▊┌▁▃╸▗"
+    ];
+    
+    // Create animated desert with jungle overlay
+    let mut lines = Vec::new();
+    
+    for y in 0..height {
+        let mut spans = Vec::new();
+        
+        for x in 0..width {
+            // Choose character based on animation progress and position
+            let char_to_show = if progress > 0.5 && y < jungle_art.len() {
+                // Show jungle during second half of animation
+                let jungle_line = &jungle_art[y];
+                let jungle_chars: Vec<char> = jungle_line.chars().collect();
+                if x < jungle_chars.len() {
+                    jungle_chars[x].to_string()
+                } else {
+                    " ".to_string()
+                }
+            } else if y < height / 3 {
+                // Sky area - stars appear based on progress
+                if (x + y) % 12 == 0 && progress > 0.2 {
+                    "⭐".to_string()
+                } else if (x + y * 2) % 16 == 0 && progress > 0.4 {
+                    "✦".to_string()
+                } else {
+                    " ".to_string()
+                }
+            } else if y < height * 2 / 3 {
+                // Pyramid and desert area
+                let pyramid_center_x = width / 2;
+                let pyramid_y = height / 2;
+                let scaled_size = (8.0 + 4.0 * pyramid_scale) as usize;
+                
+                if y.abs_diff(pyramid_y) < scaled_size / 3 && x.abs_diff(pyramid_center_x) < scaled_size / 2 {
+                    "▲".to_string()
+                } else if x % (12 + ((cactus_sway * 3.0) as usize % 6)) == 3 {
+                    "🌵".to_string()
+                } else if (x + y) % 20 == 0 {
+                    "🪨".to_string()
+                } else {
+                    " ".to_string()
+                }
+            } else {
+                // Ground area
+                if x % 18 == 4 {
+                    "🏜️".to_string()
+                } else if (x * 3) % 25 == 0 {
+                    "⋅".to_string()
+                } else {
+                    " ".to_string()
+                }
+            };
+            
+            // Llama position - moves across screen
+            let llama_x = (width as f32 / 3.0 + llama_offset * 2.0) as usize;
+            let llama_y = height * 3 / 4;
+            
+            if x == llama_x && y == llama_y {
+                spans.push(Span::styled("🦙", Style::default().fg(Color::Rgb(255, 215, 0))));
+            } else {
+                // Color scheme: jungle green transitioning to desert brown
+                let color = if progress > 0.5 {
+                    // Jungle colors
+                    Color::Rgb(
+                        (10 + (progress * 50.0) as u8).min(255),
+                        (80 + (progress * 80.0) as u8).min(255),
+                        (20 + (progress * 40.0) as u8).min(255),
+                    )
+                } else {
+                    // Desert colors
+                    Color::Rgb(
+                        (139 as f32 * desert_fade) as u8,
+                        (100 + (desert_fade * 69.0) as u8).min(255),
+                        (19 + (desert_fade * 40.0) as u8).min(255),
+                    )
+                };
+                spans.push(Span::styled(char_to_show, Style::default().fg(color)));
+            }
+        }
+        
+        lines.push(Line::from(spans));
+    }
+    
+    // Progress text with jungle theme
+    let progress_text = if progress > 0.5 {
+        format!("🌿 Morphing to Jungle Profile... {:.0}% 🌿", progress * 100.0)
+    } else {
+        format!("🏜️ Switching Profile... {:.0}% 🐪", progress * 100.0)
+    };
+    
+    if !lines.is_empty() {
+        let center_x = (width / 2).saturating_sub(progress_text.len() / 2);
+        let center_y = height / 8;
+        
+        if center_y < lines.len() {
+            lines[center_y] = Line::from(vec![
+                Span::raw(" ".repeat(center_x)),
+                Span::styled(progress_text, Style::default()
+                    .fg(if progress > 0.5 { Color::Green } else { Color::Yellow })
+                    .add_modifier(Modifier::BOLD)),
+            ]);
+        }
+    }
+    
+    let title = if progress > 0.5 {
+        " 🌿 Jungle Transformation 🌿 "
+    } else {
+        " 🏜️ Desert Mirage 🏜️ "
+    };
+    
+    let animation_paragraph = Paragraph::new(lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if progress > 0.5 { Color::Green } else { Color::Yellow }))
+            .title(title)
+            .style(Style::default().bg(Color::Rgb(0, 0, 0))));
+    
+    f.render_widget(animation_paragraph, area);
+}
 
 pub fn run_ui(mut app: App) -> Result<App> {
     enable_raw_mode()?;
@@ -1108,6 +1633,11 @@ fn run_app<B: ratatui::backend::Backend>(
             if app.animations_enabled {
                 app.frame_count += 1;
                 app.update_animations(f.size().width);
+            }
+            
+            // Update profile animation if active
+            if app.profile_switching {
+                app.update_profile_animation();
             }
             
             let chunks = Layout::default()
@@ -1222,6 +1752,9 @@ fn run_app<B: ratatui::backend::Backend>(
                     TabIndex::GitStage => {
                         render_git_stage(f, app, main_chunks[1]);
                     }
+                    TabIndex::Profiles => {
+                        render_profiles(f, app, main_chunks[1]);
+                    }
                 }
             }
         })?;
@@ -1261,12 +1794,21 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 TabIndex::GitStage
                             }
-                            TabIndex::GitStage => TabIndex::FileGuardian,
+                            TabIndex::GitStage => {
+                                app.load_profiles();
+                                TabIndex::Profiles
+                            }
+                            TabIndex::Profiles => TabIndex::FileGuardian,
                         };
                     }
                     KeyCode::BackTab => {
                         app.active_tab = match app.active_tab {
                             TabIndex::FileGuardian => {
+                                app.load_profiles();
+                                TabIndex::Profiles
+                            }
+                            TabIndex::GitStage => TabIndex::FileGuardian,
+                            TabIndex::Profiles => {
                                 // Initialize Git view when switching to it
                                 app.refresh_git_status();
                                 if !app.git_files.is_empty() && app.git_selected_file < app.git_files.len() {
@@ -1274,7 +1816,6 @@ fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 TabIndex::GitStage
                             }
-                            TabIndex::GitStage => TabIndex::FileGuardian,
                         };
                     }
                     _ => {
@@ -1352,6 +1893,44 @@ fn run_app<B: ratatui::backend::Backend>(
                                     _ => {}
                                 }
                             }
+                            TabIndex::Profiles => {
+                                if app.profile_input_mode {
+                                    match key.code {
+                                        KeyCode::Enter => {
+                                            app.handle_profile_input();
+                                        }
+                                        KeyCode::Esc => {
+                                            app.profile_input_mode = false;
+                                            app.profile_input_buffer.clear();
+                                        }
+                                        KeyCode::Backspace => {
+                                            app.profile_input_buffer.pop();
+                                        }
+                                        KeyCode::Char(c) => {
+                                            app.profile_input_buffer.push(c);
+                                        }
+                                        _ => {}
+                                    }
+                                } else {
+                                    match key.code {
+                                        KeyCode::Up => app.move_profile_up(),
+                                        KeyCode::Down => app.move_profile_down(),
+                                        KeyCode::Enter => app.load_selected_profile(),
+                                        KeyCode::Char('s') => {
+                                            app.profile_action = ProfileAction::Save;
+                                            app.profile_input_mode = true;
+                                            app.profile_input_buffer.clear();
+                                        }
+                                        KeyCode::Char('d') => {
+                                            app.delete_selected_profile();
+                                        }
+                                        KeyCode::Char('r') => {
+                                            app.load_profiles();
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1371,8 +1950,9 @@ fn render_compact_tabs(
     area: Rect,
 ) {
     let tab_titles = match app.active_tab {
-        TabIndex::FileGuardian => " 🦙 File Guardian | Git Stage ",
-        TabIndex::GitStage => " File Guardian | 🔧 Git Stage ",
+        TabIndex::FileGuardian => " 🦙 File Guardian | Git Stage | Profiles ",
+        TabIndex::GitStage => " File Guardian | 🔧 Git Stage | Profiles ",
+        TabIndex::Profiles => " File Guardian | Git Stage | 🏜️ Profiles ",
     };
     
     let tab_line = Line::from(vec![
@@ -1435,7 +2015,7 @@ fn render_help_overlay(
             Line::from("Navigation:"),
             Line::from("  ←→        Switch between file list and diff"),
             Line::from("  ↑↓        Navigate files or scroll diff"),
-            Line::from("  Tab       Switch to File Guardian"),
+            Line::from("  Tab       Switch to Profiles"),
             Line::from(""),
             Line::from("File List Actions:"),
             Line::from("  Space     Stage/unstage file"),
@@ -1453,6 +2033,33 @@ fn render_help_overlay(
             Line::from("  R         Renamed file"),
             Line::from("  ??        Untracked file"),
             Line::from("  ●○        Staged/unstaged indicator"),
+            Line::from(""),
+            Line::from("Global:"),
+            Line::from("  ?         Toggle this help"),
+            Line::from("  q         Quit"),
+        ],
+        TabIndex::Profiles => vec![
+            Line::from(Span::styled("🏜️ Profile Management Help", Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from("Navigation:"),
+            Line::from("  ↑↓        Navigate profiles"),
+            Line::from("  Tab       Switch to File Guardian"),
+            Line::from(""),
+            Line::from("Profile Actions:"),
+            Line::from("  Enter     Load selected profile"),
+            Line::from("  s         Save current patterns as new profile"),
+            Line::from("  d         Delete selected profile"),
+            Line::from("  r         Refresh profile list"),
+            Line::from(""),
+            Line::from("Profile Input Mode:"),
+            Line::from("  Enter     Confirm profile name"),
+            Line::from("  Esc       Cancel operation"),
+            Line::from("  Text      Type profile name"),
+            Line::from(""),
+            Line::from("Visual Indicators:"),
+            Line::from("  ● Green   Active profile"),
             Line::from(""),
             Line::from("Global:"),
             Line::from("  ?         Toggle this help"),

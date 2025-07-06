@@ -1,17 +1,36 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use anyhow::Result;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LockProfile {
+    pub locked_patterns: Vec<String>,
+    pub unlocked_patterns: Vec<String>,
+    pub allow_create_patterns: Vec<String>,
+    #[serde(default)]
+    pub description: String,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppState {
     pub root_path: PathBuf,
+    
+    // Profile system
+    #[serde(default)]
+    pub active_profile: Option<String>,
+    #[serde(default)]
+    pub profiles: HashMap<String, LockProfile>,
+    
+    // Legacy/active state (backward compatibility + current active state)
     #[serde(default)]
     pub locked_patterns: Vec<String>,
     #[serde(default)]
     pub unlocked_patterns: Vec<String>,
     #[serde(default)]
     pub allow_create_patterns: Vec<String>,
+    
     #[serde(default)]
     pub expanded_dirs: Vec<PathBuf>,
 }
@@ -20,6 +39,8 @@ impl AppState {
     pub fn new(root_path: PathBuf) -> Self {
         Self {
             root_path,
+            active_profile: None,
+            profiles: HashMap::new(),
             locked_patterns: Vec::new(),
             unlocked_patterns: vec!["**".to_string()],
             allow_create_patterns: Vec::new(),
@@ -64,6 +85,49 @@ impl AppState {
             // Otherwise calculate based on what's locked
             self.unlocked_patterns = calculate_unlocked_patterns(&self.locked_patterns);
         }
+    }
+    
+    // Profile management methods
+    pub fn save_current_as_profile(&mut self, name: String, description: String) {
+        let profile = LockProfile {
+            locked_patterns: self.locked_patterns.clone(),
+            unlocked_patterns: self.unlocked_patterns.clone(),
+            allow_create_patterns: self.allow_create_patterns.clone(),
+            description,
+        };
+        self.profiles.insert(name.clone(), profile);
+        self.active_profile = Some(name);
+    }
+    
+    pub fn switch_to_profile(&mut self, name: &str) -> bool {
+        if let Some(profile) = self.profiles.get(name) {
+            self.locked_patterns = profile.locked_patterns.clone();
+            self.unlocked_patterns = profile.unlocked_patterns.clone();
+            self.allow_create_patterns = profile.allow_create_patterns.clone();
+            self.active_profile = Some(name.to_string());
+            true
+        } else {
+            false
+        }
+    }
+    
+    pub fn get_profile_names(&self) -> Vec<String> {
+        self.profiles.keys().cloned().collect()
+    }
+    
+    pub fn delete_profile(&mut self, name: &str) -> bool {
+        if self.profiles.remove(name).is_some() {
+            if self.active_profile.as_ref() == Some(&name.to_string()) {
+                self.active_profile = None;
+            }
+            true
+        } else {
+            false
+        }
+    }
+    
+    pub fn get_active_profile_name(&self) -> Option<&String> {
+        self.active_profile.as_ref()
     }
 }
 
