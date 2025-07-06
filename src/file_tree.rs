@@ -157,8 +157,7 @@ fn should_ignore(path: &Path, patterns: &[String], show_hidden: bool) -> bool {
                         return true;
                     }
                 }
-            } else if pattern.starts_with("*.") {
-                let extension = &pattern[2..];
+            } else if let Some(extension) = pattern.strip_prefix("*.") {
                 if let Some(ext) = path.extension() {
                     if ext.to_string_lossy() == extension {
                         return true;

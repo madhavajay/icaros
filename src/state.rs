@@ -264,7 +264,7 @@ fn optimize_patterns(lock_infos: &[LockInfo], root: &Path) -> Vec<String> {
 
         let relative = info.path.strip_prefix(root).unwrap_or(&info.path);
 
-        let pattern = if &info.path == root {
+        let pattern = if info.path == *root {
             // Special case: if the root directory itself is locked
             "**".to_string()
         } else if info.is_dir {

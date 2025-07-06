@@ -3,7 +3,7 @@ fn test_basic_functionality() {
     // Since we can't modify Cargo.toml to expose the library,
     // this is a simple test to verify the test infrastructure works
     assert_eq!(2 + 2, 4);
-    assert!(true);
+    // Basic assertion that always passes
 
     // Test path operations that would be similar to what the tool does
     use std::path::PathBuf;
@@ -30,7 +30,7 @@ fn test_json_serialization() {
 
 #[test]
 fn test_file_patterns() {
-    let patterns = vec![".git", "target", "node_modules"];
+    let patterns = [".git", "target", "node_modules"];
     let test_paths = vec![
         "/project/.git/config",
         "/project/target/debug",

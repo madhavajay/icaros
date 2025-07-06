@@ -19,6 +19,6 @@ pub fn log_to_file(message: &str) {
 #[macro_export]
 macro_rules! log_debug {
     ($($arg:tt)*) => {
-        crate::logger::log_to_file(&format!($($arg)*));
+        $crate::logger::log_to_file(&format!($($arg)*));
     };
 }

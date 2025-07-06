@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod animations;
 mod file_tree;
 mod git;
@@ -233,6 +235,7 @@ fn restore_expanded(node: &mut file_tree::TreeNode, path: &Path) -> bool {
     false
 }
 
+#[allow(dead_code)]
 fn lock_all_recursive(node: &mut file_tree::TreeNode) {
     node.is_locked = true;
     node.allow_create_in_locked = false;
@@ -241,6 +244,7 @@ fn lock_all_recursive(node: &mut file_tree::TreeNode) {
     }
 }
 
+#[allow(dead_code)]
 fn restore_locked(node: &mut file_tree::TreeNode, path: &Path) -> bool {
     if node.path == path || node.path.starts_with(path) {
         node.is_locked = true;
@@ -255,6 +259,7 @@ fn restore_locked(node: &mut file_tree::TreeNode, path: &Path) -> bool {
     false
 }
 
+#[allow(dead_code)]
 fn restore_unlocked(node: &mut file_tree::TreeNode, path: &Path) -> bool {
     if node.path == path || node.path.starts_with(path) {
         node.is_locked = false;
@@ -272,6 +277,7 @@ fn restore_unlocked(node: &mut file_tree::TreeNode, path: &Path) -> bool {
     false
 }
 
+#[allow(dead_code)]
 fn unlock_all_recursive(node: &mut file_tree::TreeNode) {
     node.is_locked = false;
     node.allow_create_in_locked = false;

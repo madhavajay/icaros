@@ -46,7 +46,7 @@ pub struct ActiveAnimation {
     pub start_time: Instant,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AnimationEngine {
     pub spells: HashMap<String, Spell>,
     pub active_animation: Option<ActiveAnimation>,
@@ -54,10 +54,7 @@ pub struct AnimationEngine {
 
 impl AnimationEngine {
     pub fn new() -> Self {
-        Self {
-            spells: HashMap::new(),
-            active_animation: None,
-        }
+        Self::default()
     }
 
     pub fn load_spells(&mut self) -> Result<()> {
@@ -271,6 +268,7 @@ impl AnimationEngine {
         }
     }
 
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.active_animation = None;
     }

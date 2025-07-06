@@ -669,6 +669,7 @@ impl App {
     }
 
     fn collect_expanded_dirs(&self, node: &TreeNode, expanded: &mut Vec<std::path::PathBuf>) {
+        let _ = self; // Suppress warning about self not being used
         if node.is_dir && node.is_expanded {
             expanded.push(node.path.clone());
         }
@@ -844,53 +845,49 @@ impl App {
     }
 
     pub fn handle_profile_input(&mut self) {
-        if !self.profile_input_buffer.trim().is_empty() {
-            match self.profile_action {
-                ProfileAction::Save => {
-                    // Load existing state and add the profile
-                    if let Ok(mut state) = crate::state::AppState::load_from_file(&self.state_file)
-                    {
-                        let description = format!(
-                            "Saved on {}",
-                            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
-                        );
+        if !self.profile_input_buffer.trim().is_empty()
+            && self.profile_action == ProfileAction::Save
+        {
+            // Load existing state and add the profile
+            if let Ok(mut state) = crate::state::AppState::load_from_file(&self.state_file) {
+                let description = format!(
+                    "Saved on {}",
+                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
+                );
 
-                        // Get current patterns from UI state, not the loaded file
-                        let current_locked = self.get_current_locked_patterns();
-                        let current_unlocked = self.get_current_unlocked_patterns();
+                // Get current patterns from UI state, not the loaded file
+                let current_locked = self.get_current_locked_patterns();
+                let current_unlocked = self.get_current_unlocked_patterns();
 
-                        // Create profile from current UI state
-                        let profile = crate::state::LockProfile {
-                            locked_patterns: current_locked,
-                            unlocked_patterns: current_unlocked,
-                            allow_create_patterns: vec![], // TODO: implement if needed
-                            description,
-                        };
+                // Create profile from current UI state
+                let profile = crate::state::LockProfile {
+                    locked_patterns: current_locked,
+                    unlocked_patterns: current_unlocked,
+                    allow_create_patterns: vec![], // TODO: implement if needed
+                    description,
+                };
 
-                        state
-                            .profiles
-                            .insert(self.profile_input_buffer.clone(), profile);
-                        state.active_profile = Some(self.profile_input_buffer.clone());
-                        self.active_profile_name = Some(self.profile_input_buffer.clone());
+                state
+                    .profiles
+                    .insert(self.profile_input_buffer.clone(), profile);
+                state.active_profile = Some(self.profile_input_buffer.clone());
+                self.active_profile_name = Some(self.profile_input_buffer.clone());
 
-                        if std::env::var("ICAROS_DEBUG").is_ok() {
-                            eprintln!(
-                                "Saving profile '{}' with {} profiles total",
-                                self.profile_input_buffer,
-                                state.profiles.len()
-                            );
-                        }
-
-                        if let Err(e) = state.save_to_file(&self.state_file) {
-                            eprintln!("Error saving profile: {}", e);
-                        } else if std::env::var("ICAROS_DEBUG").is_ok() {
-                            eprintln!("Profile saved successfully");
-                        }
-
-                        self.load_profiles();
-                    }
+                if std::env::var("ICAROS_DEBUG").is_ok() {
+                    eprintln!(
+                        "Saving profile '{}' with {} profiles total",
+                        self.profile_input_buffer,
+                        state.profiles.len()
+                    );
                 }
-                _ => {}
+
+                if let Err(e) = state.save_to_file(&self.state_file) {
+                    eprintln!("Error saving profile: {e}");
+                } else if std::env::var("ICAROS_DEBUG").is_ok() {
+                    eprintln!("Profile saved successfully");
+                }
+
+                self.load_profiles();
             }
         }
         self.profile_input_mode = false;
@@ -1196,12 +1193,9 @@ fn is_pattern_covered(specific: &str, general: &str) -> bool {
         return true;
     }
 
-    if general.ends_with("/**") {
-        let general_prefix = &general[..general.len() - 3];
-
+    if let Some(general_prefix) = general.strip_suffix("/**") {
         // Check if specific is under this directory
-        if specific.starts_with(general_prefix) {
-            let remainder = &specific[general_prefix.len()..];
+        if let Some(remainder) = specific.strip_prefix(general_prefix) {
             // It's covered if it's the exact directory or a child
             return remainder.is_empty() || remainder.starts_with('/');
         }
@@ -1215,8 +1209,7 @@ fn pattern_to_path(root: &std::path::Path, pattern: &str) -> Option<std::path::P
         return Some(root.to_path_buf());
     }
 
-    if pattern.ends_with("/**") {
-        let dir_pattern = &pattern[..pattern.len() - 3];
+    if let Some(dir_pattern) = pattern.strip_suffix("/**") {
         return Some(root.join(dir_pattern));
     }
 
@@ -1488,8 +1481,7 @@ fn render_profiles(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let profile_items: Vec<ListItem> = app
         .profile_names
         .iter()
-        .enumerate()
-        .map(|(_i, name)| {
+        .map(|name| {
             let mut spans = vec![Span::raw("  ")];
 
             // Active profile indicator
@@ -1508,7 +1500,7 @@ fn render_profiles(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let active_profile_text = app
         .active_profile_name
         .as_ref()
-        .map(|name| format!(" Active: {} ", name))
+        .map(|name| format!(" Active: {name} "))
         .unwrap_or_else(|| " No Active Profile ".to_string());
 
     let list = List::new(profile_items)
@@ -1516,7 +1508,7 @@ fn render_profiles(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Magenta))
-                .title(format!(" 🏜️ Lock Profiles 🏜️{}", active_profile_text))
+                .title(format!(" 🏜️ Lock Profiles 🏜️{active_profile_text}"))
                 .style(Style::default().bg(Color::Rgb(0, 0, 0))),
         )
         .highlight_style(
@@ -1618,20 +1610,20 @@ fn render_image_frame(f: &mut ratatui::Frame, area: Rect, image_path: &str) {
             log_debug!("Using embedded image for: {}", image_path);
             image::ImageReader::new(std::io::Cursor::new(embedded_bytes))
                 .with_guessed_format()
-                .map_err(|e| format!("Failed to create reader: {}", e))
+                .map_err(|e| format!("Failed to create reader: {e}"))
                 .and_then(|reader| {
                     reader
                         .decode()
-                        .map_err(|e| format!("Failed to decode: {}", e))
+                        .map_err(|e| format!("Failed to decode: {e}"))
                 })
         } else {
             log_debug!("Using filesystem image for: {}", image_path);
             image::ImageReader::open(image_path)
-                .map_err(|e| format!("Failed to open: {}", e))
+                .map_err(|e| format!("Failed to open: {e}"))
                 .and_then(|reader| {
                     reader
                         .decode()
-                        .map_err(|e| format!("Failed to decode: {}", e))
+                        .map_err(|e| format!("Failed to decode: {e}"))
                 })
         };
 
@@ -1664,7 +1656,7 @@ fn render_image_frame(f: &mut ratatui::Frame, area: Rect, image_path: &str) {
                 }
                 Err(e) => {
                     log_debug!("Failed to create protocol: {}", e);
-                    show_image_error(f, area, &format!("Failed to create protocol: {}", e));
+                    show_image_error(f, area, &format!("Failed to create protocol: {e}"));
                 }
             }
         }
@@ -1749,8 +1741,7 @@ pub fn run_ui(mut app: App) -> Result<App> {
                     // Check against ignore patterns
                     let ignored = watcher_ignore_patterns.iter().any(|pattern| {
                         if pattern.ends_with('/') {
-                            path_str.contains(&format!("/{}", pattern))
-                                || path_str.contains(pattern)
+                            path_str.contains(&format!("/{pattern}")) || path_str.contains(pattern)
                         } else {
                             path_str.contains(pattern)
                         }
@@ -1923,7 +1914,7 @@ fn run_app<B: ratatui::backend::Backend>(
                 }
 
                 // Add subtitle
-                let subtitle = format!(" {} Journey ", time_name);
+                let subtitle = format!(" {time_name} Journey ");
                 let _subtitle_start = (width / 2).saturating_sub(subtitle.len() / 2);
                 let _subtitle_y = 2; // This would need to be on a second line
             } else {
@@ -2025,7 +2016,7 @@ fn run_app<B: ratatui::backend::Backend>(
                 }
                 Err(e) => {
                     // More graceful error handling - just log and reset flag
-                    eprintln!("Warning: Tree refresh encountered issues: {}", e);
+                    eprintln!("Warning: Tree refresh encountered issues: {e}");
                     app.needs_refresh = false;
                     app.last_refresh = Instant::now();
                 }

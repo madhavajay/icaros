@@ -19,7 +19,7 @@ pub enum GitFileStatus {
 }
 
 impl GitFileStatus {
-    pub fn to_str(&self) -> &'static str {
+    pub fn to_str(self) -> &'static str {
         match self {
             GitFileStatus::Modified => "M",
             GitFileStatus::Added => "A",
@@ -204,7 +204,7 @@ impl GitManager {
 
         // Reset the file in the index to match HEAD
         self.repo
-            .reset_default(Some(&head.into_object()), &[file_path])?;
+            .reset_default(Some(&head.into_object()), [file_path])?;
 
         Ok(())
     }
