@@ -178,13 +178,11 @@ verify_installation() {
         local installed_version
         installed_version=$(icaros --version 2>/dev/null | head -1 || echo "unknown")
         print_success "Installation verified: ${installed_version}"
-        print_status "You can now use 'icaros' to manage your tmux sessions!"
+        print_status "You can now use 'icaros' to protect your files!"
         print_status ""
         print_status "Quick start:"
-        print_status "  icaros           # Interactive mode"
-        print_status "  icaros ls        # List sessions"
-        print_status "  icaros n myapp   # Create new session"
-        print_status "  icaros a myapp   # Attach to session"
+        print_status "  icaros           # Interactive file protection mode"
+        print_status "  icaros --help    # Show all available options"
         print_status ""
         print_status "For more information, run: icaros --help"
     else
@@ -198,33 +196,8 @@ verify_installation() {
 check_prerequisites() {
     print_status "Checking prerequisites..."
     
-    # Check if tmux is installed
-    if ! command -v tmux >/dev/null 2>&1; then
-        print_warning "tmux is not installed or not in PATH."
-        print_status "icaros requires tmux to function. Please install tmux first:"
-        print_status ""
-        print_status "  # macOS"
-        print_status "  brew install tmux"
-        print_status ""
-        print_status "  # Ubuntu/Debian"
-        print_status "  sudo apt-get install tmux"
-        print_status ""
-        print_status "  # Fedora"
-        print_status "  sudo dnf install tmux"
-        print_status ""
-        print_status "  # Arch"
-        print_status "  sudo pacman -S tmux"
-        print_status ""
-        
-        read -p "Do you want to continue installation anyway? (y/N): " -n 1 -r
-        echo
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            print_status "Installation cancelled."
-            exit 0
-        fi
-    else
-        print_success "tmux is installed: $(tmux -V)"
-    fi
+    # Currently no specific prerequisites required
+    print_success "All prerequisites met!"
 }
 
 # Main installation function
@@ -232,8 +205,8 @@ main() {
     print_status "icaros installer"
     print_status "================"
     
-    # Check prerequisites
-    check_prerequisites
+    # Check prerequisites (currently none required)
+    # check_prerequisites
     
     # Detect platform
     local platform
