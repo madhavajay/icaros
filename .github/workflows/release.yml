@@ -14,6 +14,8 @@ on:
 permissions:
   contents: write
   packages: write
+  pull-requests: write
+  actions: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -96,7 +98,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT_TOKEN || secrets.GITHUB_TOKEN }}
           fetch-depth: 0
       
       - name: Update version in Cargo.toml
@@ -110,7 +112,7 @@ jobs:
           git config user.name github-actions[bot]
           git config user.email github-actions[bot]@users.noreply.github.com
           git add Cargo.toml Cargo.lock
-          git commit -m "chore: bump version to ${{ needs.check-version.outputs.new_version }}"
+          git commit -m "chore: bump version to ${{ needs.check-version.outputs.new_version }} [skip ci]"
           git push
 
   build:
