@@ -1,6 +1,30 @@
 # Icaros
 
-A Rust-based interactive file tree viewer that helps you manage which files AI assistants can edit. It displays a folder/file tree with toggles to lock/unlock files and expandable directories.
+Guide your agents on their Vision Quests with magic songs (Software 3.0) + herbs (Software 1.0).  
+Icaros (Quechua word) are magic songs used in South American healing ceremonies used by shamans to guide and facilitate healing processes.
+
+<img src="art/icaros.jpg" alt="Icaros Art" style="height: 200px;">
+
+
+
+
+Lock you agents from changing certain files  
+<img src="art/screenshot_lock.jpg" alt="Screenshot 2" style="height: 200px;">
+
+Create profiles to easily "SWITCH"  
+<img src="art/screenshot_switch.jpg" alt="Screenshot 3" style="height: 200px;">
+
+Diff and Stage as they make progress  
+<img src="art/screenshot_diff.jpg" alt="Screenshot 1" style="height: 200px;">
+
+
+### Quick Install (One-liner)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/madhavajay/icaros/main/install.sh | bash
+```
+
+Icaros is a Rust-based interactive file tree viewer that helps you manage which files AI assistants can edit. It displays a folder/file tree with toggles to lock/unlock files and expandable directories.
 
 ## Features
 
@@ -21,22 +45,9 @@ cargo build --release
 ```
 
 ## Usage
-
-```bash
-# Run in current directory
-cargo run
-
-# Run in specific directory
-cargo run -- /path/to/directory
-
-# Specify custom state file
-cargo run -- --state-file custom_state.json
-
-# Add custom ignore patterns
-cargo run -- --ignore "*.tmp" --ignore "cache/*"
-
-# Initialize CLAUDE.md and ICAROS.md files
-cargo run -- init
+```
+icaros init # creates the software 3.0 files
+icaros      # runs the shaman
 ```
 
 ## Commands
@@ -63,21 +74,19 @@ The tool automatically saves the state immediately after each change. You don't 
 
 The tool saves a compact state file to `.icaros` using glob patterns:
 
-```json
-{
-  "root_path": "/path/to/project",
-  "locked_patterns": [
-    "src/**",
-    "tests/important_test.rs",
-    "README.md"
-  ],
-  "unlocked_patterns": ["**"],
-  "allow_create_patterns": [
-    "src",
-    "tests"
-  ],
-  "expanded_dirs": ["/path/to/project/src"]
-}
+```yaml
+root_path: /path/to/project
+locked_patterns:
+- src/**
+- tests/important_test.rs
+- README.md
+unlocked_patterns:
+- '**'
+allow_create_patterns:
+- src
+- tests
+expanded_dirs:
+- /path/to/project/src
 ```
 
 **Pattern Rules:**
@@ -167,35 +176,3 @@ cp prompts/ICAROS.md ~/Library/Application\ Support/icaros/prompts/
 # Edit with your customizations
 vim ~/Library/Application\ Support/icaros/prompts/ICAROS.md
 ```
-
-#### Method 3: Fork and Customize
-
-Fork the repository and maintain your own version with custom templates.
-
-### Template Variables
-
-The `CLAUDE_UPDATE.md` template supports:
-- `{existing_content}` - Replaced with existing CLAUDE.md content
-
-### Benefits
-
-1. **Easy Customization** - No need to edit Rust code
-2. **User Overrides** - Personal templates without modifying the app
-3. **Version Control** - Track template changes separately
-4. **Distribution** - Bundle templates with the binary
-5. **Flexibility** - Different templates for different users/orgs
-
-### Example Use Cases
-
-- Add organization-specific guidelines to ICAROS.md
-- Include project templates in CLAUDE.md
-- Customize the update behavior for existing files
-- Create templates in different languages
-
-## Future Enhancements
-
-- Tauri integration for a native GUI
-- Search functionality
-- Filter options
-- Export locked files list in different formats
-- Integration with AI tool configurations

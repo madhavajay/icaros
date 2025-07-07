@@ -1,0 +1,18 @@
+# Simple animation configuration for Icaros
+
+profile_switch:
+  trigger: "profile_switched"
+  duration_ms: 2000
+  frames:
+    - frame: 0
+      image: "art/jungle.jpg"
+    - frame: 0
+      overlay: true
+      blink_rate_ms: 200
+      text: |
+        ███████╗██╗    ██╗██╗████████╗ ██████╗██╗  ██╗
+        ██╔════╝██║    ██║██║╚══██╔══╝██╔════╝██║  ██║
+        ███████╗██║ █╗ ██║██║   ██║   ██║     ███████║
+        ╚════██║██║███╗██║██║   ██║   ██║     ██╔══██║
+        ███████║╚███╔███╔╝██║   ██║   ╚██████╗██║  ██║
+        ╚══════╝ ╚══╝╚══╝ ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝
