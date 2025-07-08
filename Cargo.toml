@@ -47,5 +47,5 @@ tempfile = "3.8"
 
 # For local development of fs_usage_sys
 # Uncomment the following lines to use the local version instead of crates.io
-# [patch.crates-io]
-# fs_usage_sys = { path = "/Users/madhavajay/dev/fs_usage_sys" }
+[patch.crates-io]
+fs_usage_sys = { path = "/Users/madhavajay/dev/fs_usage_sys" }

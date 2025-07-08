@@ -308,42 +308,20 @@ impl FsGuardianMonitor {
         
         log_to_file(&format!("DEBUG: Path {:?} is LOCKED, processing event", path));
         
-        // Handle different operations - for vim, we need to be more aggressive since it doesn't 
-        // show traditional write operations in fs_usage
-        if event.process_name.contains("vim") {
-            // For vim, treat ANY operation on locked files as a potential write
-            match event.operation.as_str() {
-                op if op.contains("stat64") || op.contains("open") => {
-                    // For vim, even stat64/open on locked files should be treated as potential writes
-                    // since vim uses complex file handling that doesn't show up as direct writes
-                    log_to_file(&format!("DEBUG: vim operation on locked file (treating as write): {}", op));
-                    Self::handle_blocked_write(event, &path, config, event_tx, file_backups, stash_manager)?;
-                }
-                op if op.contains("unlink") || op.contains("rmdir") => {
-                    log_to_file(&format!("DEBUG: vim delete operation: {}", op));
-                    Self::handle_blocked_delete(event, &path, config, event_tx, stash_manager)?;
-                }
-                _ => {
-                    log_to_file(&format!("DEBUG: vim other operation: {}", event.operation));
-                    // Treat any other vim operation as a potential write too
-                    Self::handle_blocked_write(event, &path, config, event_tx, file_backups, stash_manager)?;
-                }
+        // Handle different operations - with our updated fs_usage_sys, we now properly detect all write operations
+        match event.operation.as_str() {
+            op if op.contains("write") || op.contains("WrData") || op.contains("WrMeta") || 
+                  op.contains("rename") || op.contains("create") || op.contains("truncate") ||
+                  op.contains("chmod_extended") => {
+                log_to_file(&format!("DEBUG: Handling write-like operation: {}", op));
+                Self::handle_blocked_write(event, &path, config, event_tx, file_backups, stash_manager)?;
             }
-        } else {
-            // For other processes, use normal write detection
-            match event.operation.as_str() {
-                op if op.contains("write") || op.contains("WrData") || op.contains("WrMeta") || 
-                      op.contains("rename") || op.contains("create") || op.contains("truncate") => {
-                    log_to_file(&format!("DEBUG: Handling write-like operation: {}", op));
-                    Self::handle_blocked_write(event, &path, config, event_tx, file_backups, stash_manager)?;
-                }
-                op if op.contains("unlink") || op.contains("rmdir") => {
-                    log_to_file(&format!("DEBUG: Handling delete operation: {}", op));
-                    Self::handle_blocked_delete(event, &path, config, event_tx, stash_manager)?;
-                }
-                _ => {
-                    log_to_file(&format!("DEBUG: Ignoring operation: {} (read-only)", event.operation));
-                }
+            op if op.contains("unlink") || op.contains("rmdir") => {
+                log_to_file(&format!("DEBUG: Handling delete operation: {}", op));
+                Self::handle_blocked_delete(event, &path, config, event_tx, stash_manager)?;
+            }
+            _ => {
+                log_to_file(&format!("DEBUG: Ignoring operation: {} (read-only)", event.operation));
             }
         }
         
@@ -368,14 +346,41 @@ impl FsGuardianMonitor {
         let timestamp = Utc::now();
         
         // For vim, we need to handle the actual file, not just swap files
-        let actual_path = if path.to_string_lossy().contains(".swp") && event.process_name.contains("vim") {
-            // Convert swap file path to actual file path
+        let actual_path = if event.process_name.contains("vim") {
+            // Check if this is a swap file (.swp, .swx, .swo, etc.)
             let path_str = path.to_string_lossy();
-            let actual_path_str = path_str
-                .replace("/.main.rs.swp", "/main.rs")
-                .replace("/.lib.rs.swp", "/lib.rs")
-                .replace("/.config.toml.swp", "/config.toml");
-            PathBuf::from(actual_path_str.to_string())
+            if let Some(file_name) = path.file_name() {
+                let name_str = file_name.to_string_lossy();
+                // Vim swap files start with . and end with .swp/.swx/.swo etc.
+                if name_str.starts_with('.') && (name_str.ends_with(".swp") || 
+                                                 name_str.ends_with(".swx") || 
+                                                 name_str.ends_with(".swo")) {
+                    // Extract the original filename from swap file
+                    // .filename.swp -> filename
+                    let original_name = name_str.trim_start_matches('.')
+                                               .trim_end_matches(".swp")
+                                               .trim_end_matches(".swx")
+                                               .trim_end_matches(".swo");
+                    
+                    if let Some(parent) = path.parent() {
+                        parent.join(original_name)
+                    } else {
+                        path.to_path_buf()
+                    }
+                } else if path_str.ends_with("~") {
+                    // Handle vim backup files (filename~)
+                    PathBuf::from(path_str.trim_end_matches('~'))
+                } else if path_str.contains("/4913") || path_str.matches(|c: char| c.is_numeric()).count() == path_str.len() {
+                    // Handle vim temporary files (numeric names)
+                    // This is tricky - we need to track what file vim is editing
+                    // For now, we'll just use the path as-is
+                    path.to_path_buf()
+                } else {
+                    path.to_path_buf()
+                }
+            } else {
+                path.to_path_buf()
+            }
         } else {
             path.to_path_buf()
         };
@@ -390,9 +395,9 @@ impl FsGuardianMonitor {
         
         match config.block_mode {
             BlockMode::Revert => {
-                // For vim, we need to wait a bit for the file to be written
-                if event.process_name.contains("vim") {
-                    thread::sleep(Duration::from_millis(100));
+                // For rename operations (common with vim), we need to wait for the operation to complete
+                if event.operation.contains("rename") || event.process_name.contains("vim") {
+                    thread::sleep(Duration::from_millis(200));
                 }
                 
                 // Try to get backup content
