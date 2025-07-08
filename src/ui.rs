@@ -23,6 +23,12 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use std::sync::mpsc::{channel, Receiver};
 use notify::{Watcher, RecursiveMode, Event as NotifyEvent};
+
+#[derive(Debug)]
+enum FileWatchEvent {
+    FileChanged,
+    ConfigChanged,
+}
 use std::collections::HashSet;
 use std::process::Command;
 
@@ -70,6 +76,7 @@ pub struct App {
     pub profile_switching: bool,
     // File system monitoring
     pub enable_monitoring: bool,
+    pub verbose_logging: bool,
     #[cfg(target_os = "macos")]
     pub monitor: Option<fs_monitor::FsGuardianMonitor>,
     #[cfg(target_os = "macos")]
@@ -174,7 +181,7 @@ fn log_to_file(message: &str) {
 }
 
 impl App {
-    pub fn new(tree: TreeNode, state_file: std::path::PathBuf, root_path: std::path::PathBuf) -> Self {
+    pub fn new(tree: TreeNode, state_file: std::path::PathBuf, root_path: std::path::PathBuf, verbose: bool) -> Self {
         log_to_file(&format!("UI: Creating new App for root path: {:?}", root_path));
         
         // Try to initialize Git manager
@@ -224,6 +231,7 @@ impl App {
             animation_start: None,
             profile_switching: false,
             enable_monitoring: false,
+            verbose_logging: verbose,
             monitor: None,
             monitor_events: Vec::new(),
             show_monitor_notifications: true,
@@ -631,6 +639,7 @@ impl App {
                 
                 let mut config = fs_monitor::MonitorConfig::default();
                 config.monitored_processes = blocked_processes;
+                config.verbose = self.verbose_logging;
                 
                 match fs_monitor::FsGuardianMonitor::new(config, self.root_path.clone()) {
                     Ok(mut monitor) => {
@@ -1895,9 +1904,26 @@ pub fn run_ui(mut app: App) -> Result<App> {
 
     // Set up file watcher
     let (tx, rx) = channel();
+    let state_file_path = app.state_file.clone();
     let mut watcher = notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
-        if let Ok(_event) = res {
-            let _ = tx.send(());
+        if let Ok(event) = res {
+            // Check if the .icaros file was modified
+            let mut is_config_change = false;
+            for path in &event.paths {
+                if path == &state_file_path {
+                    if app.verbose_logging {
+                        log_to_file("UI: Detected change to .icaros file");
+                    }
+                    is_config_change = true;
+                    break;
+                }
+            }
+            
+            if is_config_change {
+                let _ = tx.send(FileWatchEvent::ConfigChanged);
+            } else {
+                let _ = tx.send(FileWatchEvent::FileChanged);
+            }
         }
     })?;
     
@@ -1957,7 +1983,7 @@ fn get_native_pattern(frame: u64, offset: usize) -> &'static str {
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    fs_events: Receiver<()>,
+    fs_events: Receiver<FileWatchEvent>,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
     let tick_rate = Duration::from_millis(50);
@@ -1968,7 +1994,7 @@ fn run_app<B: ratatui::backend::Backend>(
             // Update animations
             if app.animations_enabled {
                 app.frame_count += 1;
-                app.update_animations(f.size().width);
+                app.update_animations(f.area().width);
             }
             
             // Update profile animation if active
@@ -1985,7 +2011,7 @@ fn run_app<B: ratatui::backend::Backend>(
                     Constraint::Length(3),  // Top title bar
                     Constraint::Min(0),     // Main content area
                 ].as_ref())
-                .split(f.size());
+                .split(f.area());
 
             // Create animated title with gradient background
             let mut title_spans = Vec::new();
@@ -2101,10 +2127,37 @@ fn run_app<B: ratatui::backend::Backend>(
         })?;
 
         // Check for file system events (non-blocking)
-        if fs_events.try_recv().is_ok() {
-            // Set flag to refresh, but debounce to avoid too many updates
-            if app.last_refresh.elapsed() > debounce_duration {
-                app.needs_refresh = true;
+        if let Ok(event) = fs_events.try_recv() {
+            match event {
+                FileWatchEvent::FileChanged => {
+                    // Set flag to refresh, but debounce to avoid too many updates
+                    if app.last_refresh.elapsed() > debounce_duration {
+                        app.needs_refresh = true;
+                    }
+                }
+                FileWatchEvent::ConfigChanged => {
+                    if app.verbose_logging {
+                        log_to_file("UI: Handling config change event");
+                    }
+                    // Reload the blocked processes from the config file
+                    if app.enable_monitoring && app.monitor.is_some() {
+                        if let Ok(state) = crate::state::AppState::load_from_file(&app.state_file) {
+                            if app.verbose_logging {
+                                log_to_file(&format!("UI: Reloading blocked processes: {:?}", state.blocked_processes));
+                            }
+                            
+                            // Update the monitor with new blocked processes
+                            if let Some(ref monitor) = app.monitor {
+                                if let Err(e) = monitor.update_monitored_processes(state.blocked_processes.clone()) {
+                                    log_to_file(&format!("UI: Failed to update monitored processes: {}", e));
+                                    app.monitor_events.push(fs_monitor::GuardianEvent::MonitorError(
+                                        format!("Failed to update monitored processes: {}", e)
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         

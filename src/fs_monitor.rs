@@ -10,10 +10,15 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::thread;
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
 use sha2::{Sha256, Digest};
 
 use crate::stash::{StashManager, ProcessInfo};
+
+fn is_write_or_delete_op(operation: &str) -> bool {
+    operation.contains("write") || operation.contains("WrData") || operation.contains("WrMeta") || 
+    operation.contains("rename") || operation.contains("create") || operation.contains("truncate") ||
+    operation.contains("chmod_extended") || operation.contains("unlink") || operation.contains("rmdir")
+}
 
 fn log_to_file(message: &str) {
     let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
@@ -41,6 +46,7 @@ pub struct MonitorConfig {
     pub auto_stash: bool,
     pub monitored_processes: Vec<String>,
     pub block_mode: BlockMode,
+    pub verbose: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -80,7 +86,7 @@ pub enum GuardianEvent {
 pub struct FsGuardianMonitor {
     monitor: Option<fs_usage_sys::FsUsageMonitor>,
     locked_paths: Arc<RwLock<HashSet<PathBuf>>>,
-    config: MonitorConfig,
+    config: Arc<RwLock<MonitorConfig>>,
     event_tx: Sender<GuardianEvent>,
     event_rx: Receiver<GuardianEvent>,
     stash_manager: StashManager,
@@ -119,7 +125,7 @@ impl FsGuardianMonitor {
         Ok(Self {
             monitor: None,
             locked_paths: Arc::new(RwLock::new(HashSet::new())),
-            config,
+            config: Arc::new(RwLock::new(config)),
             event_tx,
             event_rx,
             stash_manager: StashManager::new(stash_dir)?,
@@ -185,13 +191,21 @@ impl FsGuardianMonitor {
             while *is_running.read().unwrap() {
                 loop_count += 1;
                 if loop_count % 100 == 0 {  // Every 10 seconds (100 * 100ms)
-                    log_to_file(&format!("MONITOR: Thread alive, loop #{}, {} events so far", loop_count, event_count));
+                    let verbose = config.read().unwrap().verbose;
+                    if verbose {
+                        log_to_file(&format!("MONITOR: Thread alive, loop #{}, {} events so far", loop_count, event_count));
+                    }
                 }
                 match monitor_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(event) => {
                         event_count += 1;
-                        log_to_file(&format!("MONITOR: Received event #{}: {} {} {}", 
-                                             event_count, event.process_name, event.operation, event.path));
+                        if event.process_name != "icaros" && event.process_name != "Finder" {
+                            let verbose = config.read().unwrap().verbose;
+                            if verbose || is_write_or_delete_op(&event.operation) {
+                                log_to_file(&format!("MONITOR: Received event #{}: {} {} {}", 
+                                                     event_count, event.process_name, event.operation, event.path));
+                            }
+                        }
                         
                         if let Err(e) = Self::handle_fs_event(
                             &event, 
@@ -236,6 +250,14 @@ impl FsGuardianMonitor {
         Ok(())
     }
     
+    pub fn update_monitored_processes(&self, processes: Vec<String>) -> Result<()> {
+        let mut config = self.config.write().unwrap();
+        log_to_file(&format!("MONITOR: Updating monitored processes from {:?} to {:?}", 
+                           config.monitored_processes, processes));
+        config.monitored_processes = processes;
+        Ok(())
+    }
+    
     pub fn events(&self) -> &Receiver<GuardianEvent> {
         &self.event_rx
     }
@@ -248,20 +270,33 @@ impl FsGuardianMonitor {
         event: &FsEvent,
         locked_paths: &Arc<RwLock<HashSet<PathBuf>>>,
         file_backups: &Arc<RwLock<std::collections::HashMap<PathBuf, Vec<u8>>>>,
-        config: &MonitorConfig,
+        config: &Arc<RwLock<MonitorConfig>>,
         event_tx: &Sender<GuardianEvent>,
         stash_manager: &StashManager,
     ) -> Result<()> {
-        // Log ALL events for debugging
-        log_to_file(&format!("FS_EVENT: {} [{}] {} (PID: {})", 
-                  event.process_name, event.operation, event.path, event.pid));
+        // Get config
+        let config_guard = config.read().unwrap();
+        let verbose = config_guard.verbose;
+        
+        // Log events based on mode (except icaros and Finder)
+        if event.process_name != "icaros" && event.process_name != "Finder" {
+            if verbose || is_write_or_delete_op(&event.operation) {
+                log_to_file(&format!("FS_EVENT: {} [{}] {} (PID: {})", 
+                          event.process_name, event.operation, event.path, event.pid));
+            }
+        }
         
         // Check if this is from a monitored process
-        let is_monitored = config.monitored_processes.is_empty() || 
-            config.monitored_processes.iter().any(|p| event.process_name.contains(p));
+        let is_monitored = config_guard.monitored_processes.is_empty() || 
+            config_guard.monitored_processes.iter().any(|p| event.process_name.contains(p));
         
         if !is_monitored {
-            log_to_file(&format!("DEBUG: Process '{}' not in monitored list - allowing", event.process_name));
+            if event.process_name != "icaros" && event.process_name != "Finder" {
+                if verbose {
+                    log_to_file(&format!("DEBUG: Process '{}' not in monitored list - allowing", event.process_name));
+                }
+            }
+            drop(config_guard); // Drop the guard before returning
             
             // IMPORTANT: Update backup for non-monitored processes (allowed writes)
             // This ensures vim reverts to the latest allowed version, not the initial backup
@@ -279,8 +314,14 @@ impl FsGuardianMonitor {
                         let mut backups = file_backups.write().unwrap();
                         let old_size = backups.get(&event_path).map(|b| b.len()).unwrap_or(0);
                         backups.insert(event_path.clone(), new_content.clone());
-                        log_to_file(&format!("BACKUP: Updated backup for {:?} after non-monitored write ({} -> {} bytes)", 
-                                           event_path, old_size, new_content.len()));
+                        if event.process_name != "icaros" && event.process_name != "Finder" {
+                            // Re-check verbose flag after dropping guard
+                            let verbose = config.read().unwrap().verbose;
+                            if verbose {
+                                log_to_file(&format!("BACKUP: Updated backup for {:?} after non-monitored write ({} -> {} bytes)", 
+                                                   event_path, old_size, new_content.len()));
+                            }
+                        }
                     }
                 }
             }
@@ -293,35 +334,49 @@ impl FsGuardianMonitor {
         // Check if this path is locked
         let is_locked = {
             let locked = locked_paths.read().unwrap();
-            log_to_file(&format!("DEBUG: Checking if {:?} is locked against {} paths", path, locked.len()));
-            for locked_path in locked.iter() {
-                log_to_file(&format!("  - comparing against {:?}", locked_path));
+            if verbose {
+                log_to_file(&format!("DEBUG: Checking if {:?} is locked against {} paths", path, locked.len()));
+            }
+            if verbose {
+                for locked_path in locked.iter() {
+                    log_to_file(&format!("  - comparing against {:?}", locked_path));
+                }
             }
             Self::is_path_locked(&path, &locked)
         };
         
         if !is_locked {
-            log_to_file(&format!("✅ ALLOWED: Path {:?} is not locked, allowing {} by {}", 
-                               path, event.operation, event.process_name));
+            if verbose {
+                log_to_file(&format!("✅ ALLOWED: Path {:?} is not locked, allowing {} by {}", 
+                                   path, event.operation, event.process_name));
+            }
             return Ok(());
         }
         
-        log_to_file(&format!("DEBUG: Path {:?} is LOCKED, processing event", path));
+        if verbose {
+            log_to_file(&format!("DEBUG: Path {:?} is LOCKED, processing event", path));
+        }
         
         // Handle different operations - with our updated fs_usage_sys, we now properly detect all write operations
         match event.operation.as_str() {
             op if op.contains("write") || op.contains("WrData") || op.contains("WrMeta") || 
                   op.contains("rename") || op.contains("create") || op.contains("truncate") ||
                   op.contains("chmod_extended") => {
-                log_to_file(&format!("DEBUG: Handling write-like operation: {}", op));
-                Self::handle_blocked_write(event, &path, config, event_tx, file_backups, stash_manager)?;
+                if verbose {
+                    log_to_file(&format!("DEBUG: Handling write-like operation: {}", op));
+                }
+                Self::handle_blocked_write(event, &path, &*config_guard, event_tx, file_backups, stash_manager)?;
             }
             op if op.contains("unlink") || op.contains("rmdir") => {
-                log_to_file(&format!("DEBUG: Handling delete operation: {}", op));
-                Self::handle_blocked_delete(event, &path, config, event_tx, stash_manager)?;
+                if verbose {
+                    log_to_file(&format!("DEBUG: Handling delete operation: {}", op));
+                }
+                Self::handle_blocked_delete(event, &path, &*config_guard, event_tx, stash_manager)?;
             }
             _ => {
-                log_to_file(&format!("DEBUG: Ignoring operation: {} (read-only)", event.operation));
+                if verbose {
+                    log_to_file(&format!("DEBUG: Ignoring operation: {} (read-only)", event.operation));
+                }
             }
         }
         
@@ -683,6 +738,7 @@ impl Default for MonitorConfig {
                 "nvim".to_string(),
             ],
             block_mode: BlockMode::Revert,
+            verbose: false,
         }
     }
 }
