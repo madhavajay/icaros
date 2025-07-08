@@ -1,14 +1,15 @@
-use crate::animations::AnimationEngine;
 use crate::file_tree::TreeNode;
-use crate::git::{GitFile, GitHunk, GitManager};
-use crate::log_debug;
-use anyhow::Result;
+use crate::git::{GitManager, GitFile, GitHunk};
+#[cfg(target_os = "macos")]
+use crate::fs_monitor;
+use std::fs::OpenOptions;
+use std::io::Write;
+use chrono::Utc;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use notify::{Event as NotifyEvent, RecursiveMode, Watcher};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
@@ -17,10 +18,19 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Terminal,
 };
-use std::collections::HashSet;
 use std::io;
-use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
+use anyhow::Result;
+use std::sync::mpsc::{channel, Receiver};
+use notify::{Watcher, RecursiveMode, Event as NotifyEvent};
+
+#[derive(Debug)]
+enum FileWatchEvent {
+    FileChanged,
+    ConfigChanged,
+}
+use std::collections::HashSet;
+use std::process::Command;
 
 pub struct App {
     pub tree: TreeNode,
@@ -53,6 +63,7 @@ pub struct App {
     pub git_pane: GitPane,
     pub show_help: bool,
     // Profile system
+    pub show_profile_menu: bool,
     pub profile_list_state: ListState,
     pub profile_names: Vec<String>,
     pub active_profile_name: Option<String>,
@@ -60,15 +71,21 @@ pub struct App {
     pub profile_input_buffer: String,
     pub profile_action: ProfileAction,
     // Animation system
+    pub animation_state: AnimationState,
+    pub animation_start: Option<Instant>,
     pub profile_switching: bool,
-    // Simple animation engine
-    pub animation_engine: AnimationEngine,
-    // Delayed profile switch
-    pub pending_profile_switch: Option<String>,
-    // Image to display
-    pub current_image_path: Option<String>,
-    // Stateful image protocol for better rendering
-    pub image_state: Option<Box<dyn ratatui_image::protocol::Protocol>>,
+    // File system monitoring
+    pub enable_monitoring: bool,
+    pub verbose_logging: bool,
+    #[cfg(target_os = "macos")]
+    pub monitor: Option<fs_monitor::FsGuardianMonitor>,
+    #[cfg(target_os = "macos")]
+    pub monitor_events: Vec<fs_monitor::GuardianEvent>,
+    #[cfg(not(target_os = "macos"))]
+    pub monitor: Option<()>,
+    #[cfg(not(target_os = "macos"))]
+    pub monitor_events: Vec<String>,
+    pub show_monitor_notifications: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -82,6 +99,20 @@ pub enum TabIndex {
 pub enum ProfileAction {
     None,
     Save,
+    Load,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AnimationState {
+    None,
+    ProfileSwitch {
+        progress: f32,
+        pyramid_scale: f32,
+        llama_offset: f32,
+        cactus_sway: f32,
+        desert_fade: f32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -90,11 +121,15 @@ pub enum GitPane {
     DiffView,
 }
 
+
 const NATIVE_PATTERNS: &[&str] = &[
-    "◇", "◈", "◊", "⟡", "✦", "✧", "◉", "◎", "▲", "▼", "◆", "♦", "⬟", "⬢", "⬣", "⬡",
+    "◇", "◈", "◊", "⟡", "✦", "✧", "◉", "◎", 
+    "▲", "▼", "◆", "♦", "⬟", "⬢", "⬣", "⬡"
 ];
 
-const DESERT_ELEMENTS: &[&str] = &["🌵", "🏜️", "⛰️", "🪨", "🌄", "🌅"];
+const DESERT_ELEMENTS: &[&str] = &[
+    "🌵", "🏜️", "⛰️", "🪨", "🌄", "🌅"
+];
 
 const TIME_ELEMENTS: &[(&str, &str)] = &[
     ("☀️", "Dawn"),
@@ -105,32 +140,50 @@ const TIME_ELEMENTS: &[(&str, &str)] = &[
 ];
 
 const EARTH_COLORS: &[Color] = &[
-    Color::Rgb(184, 134, 11),  // Dark goldenrod
-    Color::Rgb(210, 105, 30),  // Chocolate
-    Color::Rgb(205, 133, 63),  // Peru
-    Color::Rgb(222, 184, 135), // Burlywood
-    Color::Rgb(160, 82, 45),   // Sienna
-    Color::Rgb(139, 69, 19),   // Saddle brown
-    Color::Rgb(255, 140, 0),   // Dark orange
-    Color::Rgb(218, 165, 32),  // Goldenrod
+    Color::Rgb(184, 134, 11),   // Dark goldenrod
+    Color::Rgb(210, 105, 30),   // Chocolate
+    Color::Rgb(205, 133, 63),   // Peru
+    Color::Rgb(222, 184, 135),  // Burlywood
+    Color::Rgb(160, 82, 45),    // Sienna
+    Color::Rgb(139, 69, 19),    // Saddle brown
+    Color::Rgb(255, 140, 0),    // Dark orange
+    Color::Rgb(218, 165, 32),   // Goldenrod
 ];
 
 const SUNSET_GRADIENT: &[Color] = &[
-    Color::Rgb(255, 94, 77),  // Sunset red
-    Color::Rgb(255, 140, 0),  // Dark orange
-    Color::Rgb(255, 206, 84), // Sunset yellow
-    Color::Rgb(237, 117, 56), // Sunset orange
-    Color::Rgb(95, 39, 205),  // Sunset purple
-    Color::Rgb(52, 31, 151),  // Deep purple
-    Color::Rgb(0, 0, 70),     // Night blue
+    Color::Rgb(255, 94, 77),    // Sunset red
+    Color::Rgb(255, 140, 0),    // Dark orange
+    Color::Rgb(255, 206, 84),   // Sunset yellow
+    Color::Rgb(237, 117, 56),   // Sunset orange
+    Color::Rgb(95, 39, 205),    // Sunset purple
+    Color::Rgb(52, 31, 151),    // Deep purple
+    Color::Rgb(0, 0, 70),       // Night blue
 ];
 
+
+fn log_to_file(message: &str) {
+    let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
+    let log_message = format!("[{}] {}\n", timestamp, message);
+    
+    // Create logs directory if it doesn't exist
+    if let Err(_) = std::fs::create_dir_all("logs") {
+        return; // Can't create directory, can't log
+    }
+    
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("logs/unified.log")
+    {
+        let _ = file.write_all(log_message.as_bytes());
+        let _ = file.flush();
+    }
+}
+
 impl App {
-    pub fn new(
-        tree: TreeNode,
-        state_file: std::path::PathBuf,
-        root_path: std::path::PathBuf,
-    ) -> Self {
+    pub fn new(tree: TreeNode, state_file: std::path::PathBuf, root_path: std::path::PathBuf, verbose: bool) -> Self {
+        log_to_file(&format!("UI: Creating new App for root path: {:?}", root_path));
+        
         // Try to initialize Git manager
         let git_manager = GitManager::new(&root_path).ok();
         let git_files = if let Some(ref git) = git_manager {
@@ -138,7 +191,7 @@ impl App {
         } else {
             Vec::new()
         };
-
+        
         let mut app = Self {
             tree,
             list_state: ListState::default(),
@@ -167,33 +220,32 @@ impl App {
             git_selected_hunk: 0,
             git_pane: GitPane::FileList,
             show_help: false,
+            show_profile_menu: false,
             profile_list_state: ListState::default(),
             profile_names: Vec::new(),
             active_profile_name: None,
             profile_input_mode: false,
             profile_input_buffer: String::new(),
             profile_action: ProfileAction::None,
+            animation_state: AnimationState::None,
+            animation_start: None,
             profile_switching: false,
-            animation_engine: AnimationEngine::new(),
-            pending_profile_switch: None,
-            current_image_path: None,
-            image_state: None,
+            enable_monitoring: false,
+            verbose_logging: verbose,
+            monitor: None,
+            monitor_events: Vec::new(),
+            show_monitor_notifications: true,
         };
         app.update_items();
         app.list_state.select(Some(0));
         if !app.git_files.is_empty() {
             app.git_file_list_state.select(Some(0));
         }
-
-        // Load animation spells
-        log_debug!("UI: Loading animation spells");
-        if let Err(e) = app.animation_engine.load_spells() {
-            log_debug!("UI: ERROR - Failed to load animation spells: {}", e);
-            eprintln!("Warning: Failed to load animation spells: {e}");
-        } else {
-            log_debug!("UI: Animation spells loaded successfully");
-        }
-
+        
+        // Auto-start monitoring
+        log_to_file("UI: Auto-starting monitoring");
+        app.toggle_monitoring();
+        
         app
     }
 
@@ -203,13 +255,13 @@ impl App {
         if self.llama_x > width as f32 + 10.0 {
             self.llama_x = -5.0;
         }
-
+        
         // Update day/night cycle
         self.day_night_cycle += 0.005;
         if self.day_night_cycle > 1.0 {
             self.day_night_cycle = 0.0;
         }
-
+        
         // Update wave offset for gradient effects
         self.wave_offset += 0.1;
     }
@@ -225,9 +277,9 @@ impl App {
         if !self.show_hidden && node.name.starts_with('.') && indent > 0 {
             return;
         }
-
+        
         self.items.push((node.clone(), indent));
-
+        
         if node.is_dir && node.is_expanded {
             for child in &node.children {
                 self.collect_visible_nodes(child, indent + 1);
@@ -239,89 +291,76 @@ impl App {
         if self.selected < self.items.len() {
             let path = self.items[self.selected].0.path.clone();
             let is_dir = self.items[self.selected].0.is_dir;
-
+            
             // Determine the effective lock state of this path
             let was_locked = self.is_path_effectively_locked(&path);
-
+            
             if std::env::var("ICAROS_DEBUG").is_ok() {
-                eprintln!("Toggle: {path:?}, was_locked: {was_locked}");
+                eprintln!("Toggle: {:?}, was_locked: {}", path, was_locked);
                 eprintln!("  Explicitly locked: {:?}", self.explicitly_locked_paths);
-                eprintln!(
-                    "  Explicitly unlocked: {:?}",
-                    self.explicitly_unlocked_paths
-                );
+                eprintln!("  Explicitly unlocked: {:?}", self.explicitly_unlocked_paths);
             }
-
+            
+            
             if !was_locked {
                 // LOCKING a node
                 self.explicitly_locked_paths.push(path.clone());
-
-                // Trigger lock animation
-                self.animation_engine.trigger("file_locked");
-
+                
                 // Remove this path from explicitly unlocked if it was there
                 self.explicitly_unlocked_paths.retain(|p| p != &path);
-
+                
                 // If locking a directory, clean up redundant child states
                 if is_dir {
                     // Remove child locks (they're now redundant)
-                    self.explicitly_locked_paths
-                        .retain(|p| !p.starts_with(&path) || p == &path);
+                    self.explicitly_locked_paths.retain(|p| !p.starts_with(&path) || p == &path);
                     // Remove child unlocks (they're overridden by the lock)
-                    self.explicitly_unlocked_paths
-                        .retain(|p| !p.starts_with(&path));
+                    self.explicitly_unlocked_paths.retain(|p| !p.starts_with(&path));
                 }
             } else {
                 // UNLOCKING a node
                 // First check if this is an explicit lock
                 let is_explicitly_locked = self.explicitly_locked_paths.contains(&path);
-
+                
                 if is_explicitly_locked {
                     // Remove the explicit lock
                     self.explicitly_locked_paths.retain(|p| p != &path);
-
-                    // Trigger unlock animation
-                    self.animation_engine.trigger("file_unlocked");
-
+                    
                     // If unlocking a directory that was explicitly locked,
                     // remove redundant child states
                     if is_dir {
                         // Remove child locks (parent is now unlocked)
-                        self.explicitly_locked_paths
-                            .retain(|p| !p.starts_with(&path));
+                        self.explicitly_locked_paths.retain(|p| !p.starts_with(&path));
                         // Remove child unlocks (they're redundant now)
-                        self.explicitly_unlocked_paths
-                            .retain(|p| !p.starts_with(&path));
+                        self.explicitly_unlocked_paths.retain(|p| !p.starts_with(&path));
                     }
                 } else {
                     // This is an inherited lock, check if we need to explicitly unlock
                     let has_locked_parent = self.has_locked_ancestor(&path);
-
+                    
                     if has_locked_parent {
                         // Add explicit unlock
                         self.explicitly_unlocked_paths.push(path.clone());
-
+                        
                         // If unlocking a directory, remove child states
                         if is_dir {
                             // Remove child locks
-                            self.explicitly_locked_paths
-                                .retain(|p| !p.starts_with(&path) || p == &path);
+                            self.explicitly_locked_paths.retain(|p| !p.starts_with(&path) || p == &path);
                             // Remove child unlocks
-                            self.explicitly_unlocked_paths
-                                .retain(|p| !p.starts_with(&path) || p == &path);
+                            self.explicitly_unlocked_paths.retain(|p| !p.starts_with(&path) || p == &path);
                         }
                     }
                 }
             }
-
+            
             // Clean up redundant entries
             self.cleanup_lock_lists();
-
+            
+            
             // Reapply all locks to ensure correct state
             self.reapply_explicit_locks();
-
+            
             self.update_items();
-
+            
             // Ensure selection stays on the same path
             for (i, (item_node, _)) in self.items.iter().enumerate() {
                 if item_node.path == path {
@@ -330,22 +369,22 @@ impl App {
                     break;
                 }
             }
-
+            
             self.save_state();
         }
     }
-
+    
     fn is_path_effectively_locked(&self, path: &std::path::Path) -> bool {
         // First check if this exact path is explicitly unlocked
         if self.explicitly_unlocked_paths.contains(&path.to_path_buf()) {
             return false;
         }
-
+        
         // Then check if this exact path is explicitly locked
         if self.explicitly_locked_paths.contains(&path.to_path_buf()) {
             return true;
         }
-
+        
         // Now check parent paths from most specific to least specific
         let mut current = path;
         while let Some(parent) = current.parent() {
@@ -353,7 +392,7 @@ impl App {
             if self.explicitly_unlocked_paths.iter().any(|p| p == parent) {
                 return false;
             }
-
+            
             // Check if any parent is explicitly locked
             if self.explicitly_locked_paths.iter().any(|p| p == parent) {
                 // Before returning true, check if there's an unlock between this parent and our path
@@ -366,14 +405,14 @@ impl App {
                 }
                 return true;
             }
-
+            
             current = parent;
         }
-
+        
         // No explicit lock or unlock found in the hierarchy
         false
     }
-
+    
     fn has_locked_ancestor(&self, path: &std::path::Path) -> bool {
         // Check if any ancestor is locked (excluding the path itself)
         let mut current = path;
@@ -391,8 +430,8 @@ impl App {
         }
         false
     }
-
-    fn _has_unlocked_ancestor(&self, path: &std::path::Path) -> bool {
+    
+    fn has_unlocked_ancestor(&self, path: &std::path::Path) -> bool {
         for unlocked_path in &self.explicitly_unlocked_paths {
             if unlocked_path != path && path.starts_with(unlocked_path) {
                 return true;
@@ -400,32 +439,29 @@ impl App {
         }
         false
     }
-
+    
     pub fn cleanup_lock_lists(&mut self) {
         // Remove duplicates
         let mut seen_locked = HashSet::new();
-        self.explicitly_locked_paths
-            .retain(|path| seen_locked.insert(path.clone()));
-
+        self.explicitly_locked_paths.retain(|path| seen_locked.insert(path.clone()));
+        
         let mut seen_unlocked = HashSet::new();
-        self.explicitly_unlocked_paths
-            .retain(|path| seen_unlocked.insert(path.clone()));
-
+        self.explicitly_unlocked_paths.retain(|path| seen_unlocked.insert(path.clone()));
+        
         // Remove any paths that are in both lists (unlocked takes precedence)
         let unlocked_set: HashSet<_> = self.explicitly_unlocked_paths.iter().cloned().collect();
-        self.explicitly_locked_paths
-            .retain(|path| !unlocked_set.contains(path));
-
+        self.explicitly_locked_paths.retain(|path| !unlocked_set.contains(path));
+        
         // Remove redundant unlocks (unlocks without a parent lock)
         let locked_paths = self.explicitly_locked_paths.clone();
         self.explicitly_unlocked_paths.retain(|unlock_path| {
             // Check if this unlock path has a locked ancestor
             for locked_path in &locked_paths {
                 if locked_path != unlock_path && unlock_path.starts_with(locked_path) {
-                    return true; // Keep this unlock
+                    return true;  // Keep this unlock
                 }
             }
-            false // Remove this unlock (no locked ancestor)
+            false  // Remove this unlock (no locked ancestor)
         });
     }
 
@@ -437,7 +473,7 @@ impl App {
             self.save_state();
         }
     }
-
+    
     pub fn toggle_create_in_locked_selected(&mut self) {
         if self.selected < self.items.len() {
             let path = self.items[self.selected].0.path.clone();
@@ -451,17 +487,13 @@ impl App {
         // Load existing state to preserve profiles, or create new one if it doesn't exist
         let mut state = crate::state::AppState::load_from_file(&self.state_file)
             .unwrap_or_else(|_| crate::state::AppState::new(self.root_path.clone()));
-
+        
         if std::env::var("ICAROS_DEBUG").is_ok() {
-            eprintln!(
-                "save_state: loaded {} profiles, active_profile: {:?}",
-                state.profiles.len(),
-                state.active_profile
-            );
+            eprintln!("save_state: loaded {} profiles, active_profile: {:?}", state.profiles.len(), state.active_profile);
         }
-
+        
         state.update_expanded_dirs(self.get_expanded_dirs());
-
+        
         // Convert explicit paths to patterns with deduplication
         let mut locked_patterns = std::collections::HashSet::new();
         for path in &self.explicitly_locked_paths {
@@ -478,7 +510,7 @@ impl App {
                 }
             }
         }
-
+        
         // Save explicitly unlocked patterns with deduplication
         let mut unlocked_patterns = std::collections::HashSet::new();
         for path in &self.explicitly_unlocked_paths {
@@ -491,45 +523,41 @@ impl App {
                 unlocked_patterns.insert(pattern);
             }
         }
-
+        
         // Remove any patterns that appear in both locked and unlocked
         // (unlocked takes precedence)
         for pattern in &unlocked_patterns {
             locked_patterns.remove(pattern);
         }
-
+        
         // Convert to vectors
         let mut locked_vec: Vec<String> = locked_patterns.into_iter().collect();
         let mut unlocked_vec: Vec<String> = unlocked_patterns.into_iter().collect();
-
+        
         // Optimize patterns - remove redundant ones
         // For locked patterns, we need to consider unlocked patterns too
         locked_vec = optimize_patterns_with_context(locked_vec, &unlocked_vec);
         unlocked_vec = optimize_patterns(unlocked_vec);
-
+        
         // Sort for consistent output
         locked_vec.sort();
         unlocked_vec.sort();
-
+        
         state.locked_patterns = locked_vec.clone();
         state.unlocked_patterns = unlocked_vec.clone();
-
+        
         if std::env::var("ICAROS_DEBUG").is_ok() {
             eprintln!("Saving patterns:");
-            eprintln!("  Locked: {locked_vec:?}");
-            eprintln!("  Unlocked: {unlocked_vec:?}");
+            eprintln!("  Locked: {:?}", locked_vec);
+            eprintln!("  Unlocked: {:?}", unlocked_vec);
         }
-
+        
         if std::env::var("ICAROS_DEBUG").is_ok() {
-            eprintln!(
-                "save_state: saving {} profiles, active_profile: {:?}",
-                state.profiles.len(),
-                state.active_profile
-            );
+            eprintln!("save_state: saving {} profiles, active_profile: {:?}", state.profiles.len(), state.active_profile);
         }
-
+        
         if let Err(e) = state.save_to_file(&self.state_file) {
-            eprintln!("Error saving state: {e}");
+            eprintln!("Error saving state: {}", e);
         }
     }
 
@@ -551,7 +579,7 @@ impl App {
         // Return only explicitly locked paths, not inherited ones
         self.explicitly_locked_paths.clone()
     }
-
+    
     pub fn get_unlocked_files(&self) -> Vec<std::path::PathBuf> {
         self.explicitly_unlocked_paths.clone()
     }
@@ -561,7 +589,230 @@ impl App {
         self.collect_expanded_dirs(&self.tree, &mut expanded);
         expanded
     }
+    
+    pub fn toggle_monitoring(&mut self) {
+        log_to_file("UI: toggle_monitoring() called");
+        
+        #[cfg(target_os = "macos")]
+        {
+            if self.monitor.is_some() {
+                // Stop monitoring
+                log_to_file("UI: Stopping existing monitor");
+                if let Some(mut monitor) = self.monitor.take() {
+                    let _ = monitor.stop();
+                    self.monitor_events.push(fs_monitor::GuardianEvent::MonitorStopped);
+                    log_to_file("UI: Monitor stopped successfully");
+                }
+            } else {
+                log_to_file("UI: Starting new monitor");
+                
+                // Check if we're running with sudo
+                let uid = unsafe { libc::getuid() };
+                log_to_file(&format!("UI: Current UID: {}", uid));
+                
+                if uid != 0 {
+                    // Not running as root, prompt for elevation
+                    log_to_file("UI: Not running as root, prompting for elevation");
+                    if let Err(e) = self.prompt_sudo_elevation() {
+                        log_to_file(&format!("UI: Failed to elevate permissions: {}", e));
+                        self.monitor_events.push(fs_monitor::GuardianEvent::MonitorError(
+                            format!("Failed to elevate permissions: {}", e)
+                        ));
+                    }
+                    return;
+                }
+                
+                // Create monitor with blocked processes from state
+                log_to_file("UI: Creating monitor with config from state");
+                
+                // Load blocked processes from state file
+                let blocked_processes = if let Ok(state) = crate::state::AppState::load_from_file(&self.state_file) {
+                    log_to_file(&format!("UI: Loaded {} blocked processes from state", state.blocked_processes.len()));
+                    for process in &state.blocked_processes {
+                        log_to_file(&format!("  - Blocking: {}", process));
+                    }
+                    state.blocked_processes
+                } else {
+                    log_to_file("UI: Using default blocked processes");
+                    vec!["vim".to_string(), "nvim".to_string()]
+                };
+                
+                let mut config = fs_monitor::MonitorConfig::default();
+                config.monitored_processes = blocked_processes;
+                config.verbose = self.verbose_logging;
+                
+                match fs_monitor::FsGuardianMonitor::new(config, self.root_path.clone()) {
+                    Ok(mut monitor) => {
+                        log_to_file("UI: Monitor created successfully");
+                        
+                        // Update locked paths from state patterns
+                        let locked_paths = self.get_locked_paths_from_patterns();
+                        log_to_file(&format!("UI: Setting {} locked paths for monitoring", locked_paths.len()));
+                        for path in &locked_paths {
+                            log_to_file(&format!("  - {:?}", path));
+                        }
+                        let _ = monitor.update_locked_paths(locked_paths);
+                        
+                        // Start monitoring
+                        log_to_file(&format!("UI: Starting monitor for path: {:?}", self.root_path));
+                        if let Err(e) = monitor.start(&self.root_path) {
+                            log_to_file(&format!("UI: Failed to start monitor: {}", e));
+                            self.monitor_events.push(fs_monitor::GuardianEvent::MonitorError(
+                                format!("Failed to start monitor: {}", e)
+                            ));
+                        } else {
+                            log_to_file("UI: Monitor started successfully");
+                            self.monitor = Some(monitor);
+                            self.monitor_events.push(fs_monitor::GuardianEvent::MonitorStarted);
+                        }
+                    }
+                    Err(e) => {
+                        log_to_file(&format!("UI: Failed to create monitor: {}", e));
+                        self.monitor_events.push(fs_monitor::GuardianEvent::MonitorError(
+                            format!("Failed to create monitor: {}", e)
+                        ));
+                    }
+                }
+            }
+        }
+        
+        #[cfg(not(target_os = "macos"))]
+        {
+            log_to_file("UI: Not on macOS, monitoring not available");
+            self.monitor_events.push("File monitoring is only available on macOS".to_string());
+        }
+    }
+    
+    #[cfg(target_os = "macos")]
+    fn prompt_sudo_elevation(&self) -> Result<()> {
+        log_to_file("UI: Prompting for sudo elevation");
+        
+        // Temporarily disable raw mode to show system prompts
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        
+        println!("\n🛡️  File monitoring requires administrator privileges.");
+        println!("icaros will restart with sudo to enable monitoring...");
+        println!("");
+        
+        // Get current executable arguments
+        let current_exe = std::env::current_exe()?;
+        let args: Vec<String> = std::env::args().collect();
+        
+        log_to_file(&format!("UI: Current exe: {:?}", current_exe));
+        log_to_file(&format!("UI: Current args: {:?}", args));
+        
+        // Build command to restart with sudo
+        let mut cmd = Command::new("sudo");
+        
+        // If we're running via cargo, restart with cargo
+        if args[0].contains("cargo") || std::env::var("CARGO_PKG_NAME").is_ok() {
+            cmd.arg("cargo").arg("run").arg("--");
+            // Add any arguments after the program name
+            for arg in args.iter().skip(1) {
+                cmd.arg(arg);
+            }
+        } else {
+            // Direct binary execution
+            cmd.arg(&current_exe);
+            for arg in args.iter().skip(1) {
+                cmd.arg(arg);
+            }
+        }
+        
+        log_to_file(&format!("UI: Executing sudo command: {:?}", cmd));
+        
+        // Execute the command
+        let status = cmd.status()?;
+        
+        if status.success() {
+            log_to_file("UI: Sudo restart successful");
+            // Exit this instance since the new one is running
+            std::process::exit(0);
+        } else {
+            log_to_file(&format!("UI: Sudo restart failed with status: {:?}", status));
+            // Re-enable raw mode and return to UI
+            enable_raw_mode()?;
+            execute!(io::stdout(), EnterAlternateScreen)?;
+            Err(anyhow::anyhow!("Sudo elevation cancelled or failed"))
+        }
+    }
+    
+    fn get_all_locked_paths(&self) -> Vec<std::path::PathBuf> {
+        let mut locked = Vec::new();
+        self.collect_locked_paths(&self.tree, &mut locked);
+        log_to_file(&format!("DEBUG get_all_locked_paths: Found {} locked paths from tree", locked.len()));
+        for path in &locked {
+            log_to_file(&format!("  - Tree locked path: {:?}", path));
+        }
+        locked
+    }
 
+    fn get_locked_paths_from_patterns(&self) -> Vec<std::path::PathBuf> {
+        // Read state file to get patterns
+        if let Ok(state) = crate::state::AppState::load_from_file(&self.state_file) {
+            log_to_file(&format!("DEBUG: Loaded state with {} locked patterns", state.locked_patterns.len()));
+            let mut paths = Vec::new();
+            
+            // Convert patterns to actual paths
+            for pattern in &state.locked_patterns {
+                log_to_file(&format!("DEBUG: Processing pattern: {}", pattern));
+                
+                // Handle special case: ** means monitor the root directory
+                if pattern == "**" {
+                    paths.push(self.root_path.clone());
+                    log_to_file(&format!("DEBUG: Added root path for ** pattern: {:?}", self.root_path));
+                    continue;
+                }
+                
+                // Remove /** from end if present and convert to absolute path
+                let clean_pattern = pattern.trim_end_matches("/**").trim_end_matches("/*");
+                let abs_path = if clean_pattern.is_empty() {
+                    self.root_path.clone()
+                } else {
+                    self.root_path.join(clean_pattern)
+                };
+                
+                if abs_path.exists() {
+                    paths.push(abs_path.clone());
+                    log_to_file(&format!("DEBUG: Added path: {:?}", abs_path));
+                } else {
+                    log_to_file(&format!("DEBUG: Path does not exist: {:?}", abs_path));
+                }
+            }
+            
+            paths
+        } else {
+            log_to_file("DEBUG: Failed to load state file");
+            Vec::new()
+        }
+    }
+    
+    fn collect_locked_paths(&self, node: &TreeNode, locked: &mut Vec<std::path::PathBuf>) {
+        if node.is_locked {
+            locked.push(node.path.clone());
+        }
+        for child in &node.children {
+            self.collect_locked_paths(child, locked);
+        }
+    }
+    
+    pub fn check_monitor_events(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(ref monitor) = self.monitor {
+                // Check for new events
+                while let Ok(event) = monitor.events().try_recv() {
+                    self.monitor_events.push(event);
+                    // Keep only last 10 events
+                    if self.monitor_events.len() > 10 {
+                        self.monitor_events.remove(0);
+                    }
+                }
+            }
+        }
+    }
+    
     pub fn refresh_tree(&mut self) -> Result<()> {
         // Save current state
         let expanded_dirs = self.get_expanded_dirs();
@@ -570,30 +821,21 @@ impl App {
         } else {
             None
         };
-
-        // Load ignore patterns from state or use defaults
-        let ignore_patterns =
-            if let Ok(state) = crate::state::AppState::load_from_file(&self.state_file) {
-                state.ignore_patterns
-            } else {
-                crate::state::default_ignore_patterns()
-            };
-
-        // Rebuild tree with ignore patterns and hidden file filter
-        self.tree =
-            crate::file_tree::build_tree(&self.root_path, &ignore_patterns, self.show_hidden)?;
-
+        
+        // Rebuild tree with hidden file filter
+        self.tree = crate::file_tree::build_tree(&self.root_path, &[], self.show_hidden)?;
+        
         // Reapply all explicit locks
         self.reapply_explicit_locks();
-
+        
         // Restore expanded state
         for expanded_path in &expanded_dirs {
             restore_expanded_state(&mut self.tree, expanded_path);
         }
-
+        
         // Update items
         self.update_items();
-
+        
         // Try to restore selection
         if let Some(selected_path) = current_selected_path {
             for (i, (node, _)) in self.items.iter().enumerate() {
@@ -604,24 +846,24 @@ impl App {
                 }
             }
         }
-
+        
         self.save_state();
         self.needs_refresh = false;
         self.last_refresh = Instant::now();
         Ok(())
     }
-
+    
     pub fn reapply_explicit_locks(&mut self) {
         // First, unlock everything
         unlock_all_recursive(&mut self.tree);
-
+        
         // Sort paths by depth (parent paths first)
         let mut sorted_locked = self.explicitly_locked_paths.clone();
         sorted_locked.sort_by_key(|p| p.components().count());
-
+        
         let mut sorted_unlocked = self.explicitly_unlocked_paths.clone();
         sorted_unlocked.sort_by_key(|p| p.components().count());
-
+        
         // Apply locks and unlocks in order of depth
         let mut all_paths: Vec<(std::path::PathBuf, bool)> = Vec::new();
         for path in sorted_locked {
@@ -630,7 +872,7 @@ impl App {
         for path in sorted_unlocked {
             all_paths.push((path, false)); // false = unlock
         }
-
+        
         // Sort by depth, then by lock/unlock (locks before unlocks at same depth)
         all_paths.sort_by(|a, b| {
             let depth_a = a.0.components().count();
@@ -641,25 +883,23 @@ impl App {
                     // This ensures specific locks can override general unlocks
                     b.1.cmp(&a.1)
                 }
-                other => other,
+                other => other
             }
         });
-
+        
         // Apply in order
         for (path, is_lock) in all_paths {
             if is_lock {
                 lock_path_and_children(&mut self.tree, &path);
             } else {
                 // For unlocks, check if there are any explicit locks that should be preserved
-                let child_locks: Vec<_> = self
-                    .explicitly_locked_paths
-                    .iter()
+                let child_locks: Vec<_> = self.explicitly_locked_paths.iter()
                     .filter(|p| p.starts_with(&path) && *p != &path)
                     .cloned()
                     .collect();
-
+                
                 unlock_path(&mut self.tree, &path);
-
+                
                 // Reapply any child locks that should be preserved
                 for child_lock in child_locks {
                     lock_path_and_children(&mut self.tree, &child_lock);
@@ -667,9 +907,9 @@ impl App {
             }
         }
     }
+    
 
     fn collect_expanded_dirs(&self, node: &TreeNode, expanded: &mut Vec<std::path::PathBuf>) {
-        let _ = self; // Suppress warning about self not being used
         if node.is_dir && node.is_expanded {
             expanded.push(node.path.clone());
         }
@@ -677,7 +917,7 @@ impl App {
             self.collect_expanded_dirs(child, expanded);
         }
     }
-
+    
     // Git-related methods
     pub fn refresh_git_status(&mut self) {
         if let Some(ref git) = self.git_manager {
@@ -691,7 +931,7 @@ impl App {
             }
         }
     }
-
+    
     pub fn load_git_diff(&mut self) {
         if let Some(ref git) = self.git_manager {
             if self.git_selected_file < self.git_files.len() {
@@ -704,7 +944,7 @@ impl App {
             }
         }
     }
-
+    
     pub fn toggle_git_file_stage(&mut self) {
         if let Some(ref git) = self.git_manager {
             if self.git_selected_file < self.git_files.len() {
@@ -714,7 +954,7 @@ impl App {
                 } else {
                     git.stage_file(&file.path)
                 };
-
+                
                 if result.is_ok() {
                     self.refresh_git_status();
                     self.load_git_diff();
@@ -722,48 +962,46 @@ impl App {
             }
         }
     }
-
+    
     pub fn move_git_file_up(&mut self) {
         if self.git_selected_file > 0 {
             self.git_selected_file -= 1;
-            self.git_file_list_state
-                .select(Some(self.git_selected_file));
+            self.git_file_list_state.select(Some(self.git_selected_file));
             self.load_git_diff();
         }
     }
-
+    
     pub fn move_git_file_down(&mut self) {
         if self.git_selected_file < self.git_files.len().saturating_sub(1) {
             self.git_selected_file += 1;
-            self.git_file_list_state
-                .select(Some(self.git_selected_file));
+            self.git_file_list_state.select(Some(self.git_selected_file));
             self.load_git_diff();
         }
     }
-
+    
     pub fn move_git_hunk_up(&mut self) {
         if self.git_selected_hunk > 0 {
             self.git_selected_hunk -= 1;
             // TODO: Adjust scroll to ensure hunk is visible
         }
     }
-
+    
     pub fn move_git_hunk_down(&mut self) {
         if self.git_selected_hunk < self.git_diff_hunks.len().saturating_sub(1) {
             self.git_selected_hunk += 1;
             // TODO: Adjust scroll to ensure hunk is visible
         }
     }
-
+    
     pub fn scroll_git_diff_up(&mut self) {
         self.git_diff_scroll = self.git_diff_scroll.saturating_sub(1);
     }
-
+    
     pub fn scroll_git_diff_down(&mut self) {
         // TODO: Add max scroll based on content
         self.git_diff_scroll += 1;
     }
-
+    
     // Profile management methods
     pub fn load_profiles(&mut self) {
         if let Ok(state) = crate::state::AppState::load_from_file(&self.state_file) {
@@ -774,7 +1012,7 @@ impl App {
             }
         }
     }
-
+    
     pub fn move_profile_up(&mut self) {
         if let Some(selected) = self.profile_list_state.selected() {
             if selected > 0 {
@@ -782,7 +1020,7 @@ impl App {
             }
         }
     }
-
+    
     pub fn move_profile_down(&mut self) {
         if let Some(selected) = self.profile_list_state.selected() {
             if selected < self.profile_names.len().saturating_sub(1) {
@@ -790,39 +1028,17 @@ impl App {
             }
         }
     }
-
+    
     pub fn load_selected_profile(&mut self) {
-        log_debug!("UI: load_selected_profile called");
         if let Some(selected) = self.profile_list_state.selected() {
-            log_debug!("UI: Selected profile index: {}", selected);
             if selected < self.profile_names.len() {
                 let profile_name = self.profile_names[selected].clone();
-                log_debug!("UI: Loading profile: '{}'", profile_name);
-                log_debug!("UI: Animations enabled: {}", self.animations_enabled);
-
-                if self.animations_enabled {
-                    log_debug!("UI: Starting profile switch animation");
-                    self.start_profile_switch_animation();
-                    // Delay the actual profile switch until animation shows
-                    self.pending_profile_switch = Some(profile_name.clone());
-                    log_debug!("UI: Set pending profile switch to: '{}'", profile_name);
-                } else {
-                    log_debug!("UI: No animation, switching immediately");
-                    // No animation, switch immediately
-                    self.switch_to_profile(&profile_name);
-                }
-            } else {
-                log_debug!(
-                    "UI: ERROR - Selected index {} out of bounds ({})",
-                    selected,
-                    self.profile_names.len()
-                );
+                self.start_profile_switch_animation();
+                self.switch_to_profile(&profile_name);
             }
-        } else {
-            log_debug!("UI: ERROR - No profile selected");
         }
     }
-
+    
     pub fn delete_selected_profile(&mut self) {
         if let Some(selected) = self.profile_list_state.selected() {
             if selected < self.profile_names.len() {
@@ -835,142 +1051,127 @@ impl App {
                         if self.profile_names.is_empty() {
                             self.profile_list_state.select(None);
                         } else if selected >= self.profile_names.len() {
-                            self.profile_list_state
-                                .select(Some(self.profile_names.len() - 1));
+                            self.profile_list_state.select(Some(self.profile_names.len() - 1));
                         }
                     }
                 }
             }
         }
     }
-
+    
     pub fn handle_profile_input(&mut self) {
-        if !self.profile_input_buffer.trim().is_empty()
-            && self.profile_action == ProfileAction::Save
-        {
-            // Load existing state and add the profile
-            if let Ok(mut state) = crate::state::AppState::load_from_file(&self.state_file) {
-                let description = format!(
-                    "Saved on {}",
-                    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
-                );
-
-                // Get current patterns from UI state, not the loaded file
-                let current_locked = self.get_current_locked_patterns();
-                let current_unlocked = self.get_current_unlocked_patterns();
-
-                // Create profile from current UI state
-                let profile = crate::state::LockProfile {
-                    locked_patterns: current_locked,
-                    unlocked_patterns: current_unlocked,
-                    allow_create_patterns: vec![], // TODO: implement if needed
-                    description,
-                };
-
-                state
-                    .profiles
-                    .insert(self.profile_input_buffer.clone(), profile);
-                state.active_profile = Some(self.profile_input_buffer.clone());
-                self.active_profile_name = Some(self.profile_input_buffer.clone());
-
-                if std::env::var("ICAROS_DEBUG").is_ok() {
-                    eprintln!(
-                        "Saving profile '{}' with {} profiles total",
-                        self.profile_input_buffer,
-                        state.profiles.len()
-                    );
+        if !self.profile_input_buffer.trim().is_empty() {
+            match self.profile_action {
+                ProfileAction::Save => {
+                    // Load existing state and add the profile
+                    if let Ok(mut state) = crate::state::AppState::load_from_file(&self.state_file) {
+                        let description = format!("Saved on {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"));
+                        
+                        // Get current patterns from UI state, not the loaded file
+                        let current_locked = self.get_current_locked_patterns();
+                        let current_unlocked = self.get_current_unlocked_patterns();
+                        
+                        // Create profile from current UI state
+                        let profile = crate::state::LockProfile {
+                            locked_patterns: current_locked,
+                            unlocked_patterns: current_unlocked,
+                            allow_create_patterns: vec![], // TODO: implement if needed
+                            description,
+                        };
+                        
+                        state.profiles.insert(self.profile_input_buffer.clone(), profile);
+                        state.active_profile = Some(self.profile_input_buffer.clone());
+                        self.active_profile_name = Some(self.profile_input_buffer.clone());
+                        
+                        if std::env::var("ICAROS_DEBUG").is_ok() {
+                            eprintln!("Saving profile '{}' with {} profiles total", self.profile_input_buffer, state.profiles.len());
+                        }
+                        
+                        if let Err(e) = state.save_to_file(&self.state_file) {
+                            eprintln!("Error saving profile: {}", e);
+                        } else if std::env::var("ICAROS_DEBUG").is_ok() {
+                            eprintln!("Profile saved successfully");
+                        }
+                        
+                        self.load_profiles();
+                    }
                 }
-
-                if let Err(e) = state.save_to_file(&self.state_file) {
-                    eprintln!("Error saving profile: {e}");
-                } else if std::env::var("ICAROS_DEBUG").is_ok() {
-                    eprintln!("Profile saved successfully");
-                }
-
-                self.load_profiles();
+                _ => {}
             }
         }
         self.profile_input_mode = false;
         self.profile_input_buffer.clear();
         self.profile_action = ProfileAction::None;
     }
-
+    
     pub fn switch_to_profile(&mut self, name: &str) {
         if let Ok(mut state) = crate::state::AppState::load_from_file(&self.state_file) {
             if state.switch_to_profile(name) {
                 let _ = state.save_to_file(&self.state_file);
                 self.active_profile_name = Some(name.to_string());
-
+                
                 // Apply the new patterns to the tree
                 self.explicitly_locked_paths.clear();
                 self.explicitly_unlocked_paths.clear();
-
+                
                 // Convert patterns back to paths
                 for pattern in &state.locked_patterns {
                     if let Some(path) = pattern_to_path(&self.root_path, pattern) {
                         self.explicitly_locked_paths.push(path);
                     }
                 }
-
+                
                 for pattern in &state.unlocked_patterns {
                     if let Some(path) = pattern_to_path(&self.root_path, pattern) {
                         self.explicitly_unlocked_paths.push(path);
                     }
                 }
-
+                
                 // Reapply locks to the tree
                 self.reapply_explicit_locks();
                 self.update_items();
             }
         }
     }
-
+    
     pub fn start_profile_switch_animation(&mut self) {
-        log_debug!("UI: start_profile_switch_animation called");
-        self.animation_engine.trigger("profile_switch");
+        self.animation_state = AnimationState::ProfileSwitch {
+            progress: 0.0,
+            pyramid_scale: 1.0,
+            llama_offset: 0.0,
+            cactus_sway: 0.0,
+            desert_fade: 0.0,
+        };
+        self.animation_start = Some(Instant::now());
         self.profile_switching = true;
-        log_debug!("UI: Profile switching flag set to true");
     }
-
+    
     pub fn update_profile_animation(&mut self) {
-        // Check if we need to execute the delayed profile switch
-        if self.profile_switching {
-            log_debug!("UI: update_profile_animation - profile_switching=true");
-            if let Some(ref profile_name) = self.pending_profile_switch.clone() {
-                log_debug!("UI: Pending profile switch: '{}'", profile_name);
-                if self.animation_engine.is_active() {
-                    log_debug!("UI: Animation is active");
-                    // Animation is active, wait a bit for it to show
-                    if let Some(ref active) = self.animation_engine.active_animation {
-                        let elapsed = active.start_time.elapsed().as_millis();
-                        log_debug!("UI: Animation elapsed: {}ms", elapsed);
-                        if elapsed > 200 {
-                            log_debug!("UI: Animation delay complete, switching to profile");
-                            // Now do the actual profile switch
-                            self.switch_to_profile(profile_name);
-                            self.pending_profile_switch = None;
-                        }
-                    }
-                } else {
-                    log_debug!("UI: Animation not active, switching immediately");
-                    // Animation failed to start or already ended, switch immediately
-                    self.switch_to_profile(profile_name);
-                    self.pending_profile_switch = None;
-                    self.profile_switching = false;
-                }
+        if let Some(start_time) = self.animation_start {
+            let elapsed = start_time.elapsed().as_secs_f32();
+            let progress = (elapsed / 2.0).min(1.0); // 2 second animation
+            
+            if let AnimationState::ProfileSwitch { .. } = &mut self.animation_state {
+                self.animation_state = AnimationState::ProfileSwitch {
+                    progress,
+                    pyramid_scale: 1.0 + (progress * 2.0).sin() * 0.3,
+                    llama_offset: (progress * 8.0).sin() * 10.0,
+                    cactus_sway: (progress * 6.0).sin() * 5.0,
+                    desert_fade: (progress * std::f32::consts::PI).sin(),
+                };
             }
-
-            // Clear the switching flag when animation ends
-            if !self.animation_engine.is_active() && self.pending_profile_switch.is_none() {
-                log_debug!("UI: Animation ended, clearing profile_switching flag");
+            
+            if progress >= 1.0 {
+                self.animation_state = AnimationState::None;
+                self.animation_start = None;
                 self.profile_switching = false;
             }
         }
     }
-
+    
     fn get_current_locked_patterns(&self) -> Vec<String> {
         let mut patterns = Vec::new();
-
+        
         // If no explicit locks, check if everything is locked via tree state
         if self.explicitly_locked_paths.is_empty() {
             // Check if the root is locked in the tree
@@ -993,12 +1194,12 @@ impl App {
                 }
             }
         }
-
+        
         patterns.sort();
         patterns.dedup();
         patterns
     }
-
+    
     fn get_current_unlocked_patterns(&self) -> Vec<String> {
         let mut patterns = Vec::new();
         for path in &self.explicitly_unlocked_paths {
@@ -1015,14 +1216,16 @@ impl App {
         patterns.dedup();
         patterns
     }
+    
 }
+
 
 fn toggle_expand_at_path(node: &mut TreeNode, target_path: &std::path::Path) -> bool {
     if node.path == target_path {
         node.toggle_expand();
         return true;
     }
-
+    
     for child in &mut node.children {
         if toggle_expand_at_path(child, target_path) {
             return true;
@@ -1036,7 +1239,7 @@ fn toggle_create_in_locked_at_path(node: &mut TreeNode, target_path: &std::path:
         node.toggle_create_in_locked();
         return true;
     }
-
+    
     for child in &mut node.children {
         if toggle_create_in_locked_at_path(child, target_path) {
             return true;
@@ -1060,7 +1263,7 @@ fn lock_path_and_children(node: &mut TreeNode, path: &std::path::Path) {
         lock_all_children_recursive(node);
         return;
     }
-
+    
     // If this node is an ancestor of the target path, keep searching
     if path.starts_with(&node.path) {
         for child in &mut node.children {
@@ -1077,6 +1280,7 @@ fn lock_all_children_recursive(node: &mut TreeNode) {
     }
 }
 
+
 fn unlock_path(node: &mut TreeNode, path: &std::path::Path) {
     if node.path == *path {
         node.is_locked = false;
@@ -1085,7 +1289,7 @@ fn unlock_path(node: &mut TreeNode, path: &std::path::Path) {
         unlock_all_recursive(node);
         return;
     }
-
+    
     for child in &mut node.children {
         unlock_path(child, path);
     }
@@ -1104,14 +1308,14 @@ fn optimize_patterns(patterns: Vec<String>) -> Vec<String> {
     if patterns.is_empty() {
         return patterns;
     }
-
+    
     let mut optimized: Vec<String> = Vec::new();
     let mut sorted = patterns;
     sorted.sort();
-
+    
     for pattern in sorted {
         let mut is_redundant = false;
-
+        
         // Check if this pattern is covered by any existing pattern
         for existing in &optimized {
             if is_pattern_covered(&pattern, existing) {
@@ -1119,32 +1323,29 @@ fn optimize_patterns(patterns: Vec<String>) -> Vec<String> {
                 break;
             }
         }
-
+        
         if !is_redundant {
             // Remove any patterns that this one covers
             optimized.retain(|existing| !is_pattern_covered(existing, &pattern));
             optimized.push(pattern);
         }
     }
-
+    
     optimized
 }
 
-fn optimize_patterns_with_context(
-    locked_patterns: Vec<String>,
-    unlocked_patterns: &[String],
-) -> Vec<String> {
+fn optimize_patterns_with_context(locked_patterns: Vec<String>, unlocked_patterns: &[String]) -> Vec<String> {
     if locked_patterns.is_empty() {
         return locked_patterns;
     }
-
+    
     let mut optimized: Vec<String> = Vec::new();
     let mut sorted = locked_patterns;
     sorted.sort();
-
+    
     for pattern in sorted {
         let mut is_redundant = false;
-
+        
         // Check if this pattern is covered by any existing pattern
         for existing in &optimized {
             if is_pattern_covered(&pattern, existing) {
@@ -1158,14 +1359,14 @@ fn optimize_patterns_with_context(
                         break;
                     }
                 }
-
+                
                 if !needed_for_override {
                     is_redundant = true;
                 }
                 break;
             }
         }
-
+        
         if !is_redundant {
             // Remove any patterns that this one covers, unless they're needed for overrides
             optimized.retain(|existing| {
@@ -1183,7 +1384,7 @@ fn optimize_patterns_with_context(
             optimized.push(pattern);
         }
     }
-
+    
     optimized
 }
 
@@ -1192,15 +1393,18 @@ fn is_pattern_covered(specific: &str, general: &str) -> bool {
     if general == "**" {
         return true;
     }
-
-    if let Some(general_prefix) = general.strip_suffix("/**") {
+    
+    if general.ends_with("/**") {
+        let general_prefix = &general[..general.len() - 3];
+        
         // Check if specific is under this directory
-        if let Some(remainder) = specific.strip_prefix(general_prefix) {
+        if specific.starts_with(general_prefix) {
+            let remainder = &specific[general_prefix.len()..];
             // It's covered if it's the exact directory or a child
             return remainder.is_empty() || remainder.starts_with('/');
         }
     }
-
+    
     false
 }
 
@@ -1208,37 +1412,39 @@ fn pattern_to_path(root: &std::path::Path, pattern: &str) -> Option<std::path::P
     if pattern == "**" {
         return Some(root.to_path_buf());
     }
-
-    if let Some(dir_pattern) = pattern.strip_suffix("/**") {
+    
+    if pattern.ends_with("/**") {
+        let dir_pattern = &pattern[..pattern.len() - 3];
         return Some(root.join(dir_pattern));
     }
-
+    
     Some(root.join(pattern))
 }
 
-fn render_file_guardian(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .items
+fn render_file_guardian(
+    f: &mut ratatui::Frame,
+    app: &mut App,
+    area: Rect,
+) {
+    let items: Vec<ListItem> = app.items
         .iter()
         .map(|(node, indent)| {
-            let mut spans = vec![Span::raw("  ".repeat(*indent))];
-
+            let mut spans = vec![
+                Span::raw("  ".repeat(*indent)),
+            ];
+            
             if node.is_dir {
                 spans.push(Span::raw(if node.is_expanded { "▼ " } else { "▶ " }));
             } else {
                 spans.push(Span::raw("  "));
             }
-
+            
             if node.is_locked {
-                spans.push(Span::styled(
-                    "🔒 ",
-                    Style::default().fg(Color::Rgb(255, 107, 53)),
-                ));
+                spans.push(Span::styled("🔒 ", 
+                    Style::default().fg(Color::Rgb(255, 107, 53))));
                 if node.is_dir && node.allow_create_in_locked {
-                    spans.push(Span::styled(
-                        "➕ ",
-                        Style::default().fg(Color::Rgb(0, 206, 209)),
-                    ));
+                    spans.push(Span::styled("➕ ", 
+                        Style::default().fg(Color::Rgb(0, 206, 209))));
                 } else {
                     spans.push(Span::raw("   "));
                 }
@@ -1246,122 +1452,110 @@ fn render_file_guardian(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 spans.push(Span::raw("   "));
                 spans.push(Span::raw("   "));
             }
-
+            
             let style = if node.is_locked {
                 Style::default()
-                    .fg(Color::Rgb(255, 127, 80)) // Coral
+                    .fg(Color::Rgb(255, 127, 80))  // Coral
                     .add_modifier(Modifier::BOLD)
             } else if node.is_dir {
                 Style::default()
-                    .fg(Color::Rgb(0, 206, 209)) // Static cyan for directories
+                    .fg(Color::Rgb(0, 206, 209))  // Static cyan for directories
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Rgb(255, 215, 0)) // Gold
+                Style::default()
+                    .fg(Color::Rgb(255, 215, 0))  // Gold
             };
-
+            
             spans.push(Span::styled(&node.name, style));
-
+            
             ListItem::new(Line::from(spans))
         })
         .collect();
 
+    // Add shield icon to title when monitoring is active
+    let title = if app.monitor.is_some() {
+        " 🦙🛡️ File Guardian 🦙 "
+    } else {
+        " 🦙 File Guardian 🦙 "
+    };
+    
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Rgb(138, 43, 226))) // Static violet
-                .title(" 🦙 File Guardian 🦙 ")
-                .style(Style::default().bg(Color::Rgb(0, 0, 0))),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(138, 43, 226))
-                .add_modifier(Modifier::BOLD),
-        );
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Rgb(138, 43, 226)))  // Static violet
+            .title(title)
+            .style(Style::default().bg(Color::Rgb(0, 0, 0))))
+        .highlight_style(Style::default()
+            .bg(Color::Rgb(138, 43, 226))
+            .add_modifier(Modifier::BOLD));
 
     f.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-fn render_git_stage(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+fn render_git_stage(
+    f: &mut ratatui::Frame,
+    app: &mut App,
+    area: Rect,
+) {
     // Split the area into two panes
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints(
-            [
-                Constraint::Percentage(40), // File list
-                Constraint::Percentage(60), // Diff view
-            ]
-            .as_ref(),
-        )
+        .constraints([
+            Constraint::Percentage(40), // File list
+            Constraint::Percentage(60), // Diff view
+        ].as_ref())
         .split(area);
-
+    
     // Render file list
-    let file_items: Vec<ListItem> = app
-        .git_files
+    let file_items: Vec<ListItem> = app.git_files
         .iter()
         .map(|file| {
             let status_color = file.status.color();
             let status_str = file.status.to_str();
             let staged_indicator = if file.staged { "●" } else { "○" };
-
+            
             let spans = vec![
-                Span::styled(
-                    staged_indicator,
-                    Style::default().fg(if file.staged {
-                        Color::Green
-                    } else {
-                        Color::Gray
-                    }),
-                ),
+                Span::styled(staged_indicator, Style::default().fg(if file.staged { Color::Green } else { Color::Gray })),
                 Span::raw(" "),
                 Span::styled(status_str, Style::default().fg(status_color)),
                 Span::raw(" "),
-                Span::styled(
-                    file.path.display().to_string(),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(file.path.display().to_string(), Style::default().fg(Color::White)),
             ];
-
+            
             ListItem::new(Line::from(spans))
         })
         .collect();
-
+    
     let file_list = List::new(file_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(if app.git_pane == GitPane::FileList {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }))
-                .title(" Changed Files ")
-                .style(Style::default().bg(Color::Rgb(0, 0, 0))),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(Color::Rgb(50, 50, 50))
-                .add_modifier(Modifier::BOLD),
-        );
-
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if app.git_pane == GitPane::FileList {
+                Color::Yellow
+            } else {
+                Color::Gray
+            }))
+            .title(" Changed Files ")
+            .style(Style::default().bg(Color::Rgb(0, 0, 0))))
+        .highlight_style(Style::default()
+            .bg(Color::Rgb(50, 50, 50))
+            .add_modifier(Modifier::BOLD));
+    
     f.render_stateful_widget(file_list, chunks[0], &mut app.git_file_list_state);
-
+    
     // Render diff view
     let mut diff_lines = Vec::new();
     let mut _current_line = 0;
-
+    
     for (hunk_idx, hunk) in app.git_diff_hunks.iter().enumerate() {
         // Add hunk header
         let hunk_style = if hunk_idx == app.git_selected_hunk {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Blue)
         };
         diff_lines.push(Line::from(Span::styled(&hunk.header, hunk_style)));
         _current_line += 1;
-
+        
         // Add hunk lines
         for line in &hunk.lines {
             let (style, prefix) = match line.origin {
@@ -1369,349 +1563,336 @@ fn render_git_stage(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
                 '-' => (Style::default().fg(Color::Red), "-"),
                 _ => (Style::default().fg(Color::Gray), " "),
             };
-
+            
             let content = format!("{}{}", prefix, line.content);
             diff_lines.push(Line::from(Span::styled(content, style)));
             _current_line += 1;
         }
-
+        
         // Add empty line between hunks
         if hunk_idx < app.git_diff_hunks.len() - 1 {
             diff_lines.push(Line::from(""));
             _current_line += 1;
         }
     }
-
+    
     let diff_widget = Paragraph::new(diff_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(if app.git_pane == GitPane::DiffView {
-                    Color::Yellow
-                } else {
-                    Color::Gray
-                }))
-                .title(" Diff ")
-                .style(Style::default().bg(Color::Rgb(0, 0, 0))),
-        )
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if app.git_pane == GitPane::DiffView {
+                Color::Yellow
+            } else {
+                Color::Gray
+            }))
+            .title(" Diff ")
+            .style(Style::default().bg(Color::Rgb(0, 0, 0))))
         .scroll((app.git_diff_scroll, 0));
-
+    
     f.render_widget(diff_widget, chunks[1]);
 }
 
-fn render_profiles(f: &mut ratatui::Frame, app: &mut App, area: Rect) {
+fn render_profiles(
+    f: &mut ratatui::Frame,
+    app: &mut App,
+    area: Rect,
+) {
     // Check if profile switching animation is active
-    if app.profile_switching {
-        log_debug!("RENDER: Profile switching active, checking for animation frame");
-        if let Some(frame_content) = app.animation_engine.get_current_frame() {
-            log_debug!(
-                "RENDER: Got frame content (first 50 chars): {}",
-                &frame_content.chars().take(50).collect::<String>()
-            );
-
-            // Check if this is an image marker
-            if frame_content.starts_with("IMAGE:") {
-                let image_path = frame_content.trim_start_matches("IMAGE:");
-                log_debug!("RENDER: Detected image frame, path: {}", image_path);
-                app.current_image_path = Some(image_path.to_string());
-
-                // Create layout to get the proper inner pane area
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints(
-                        [
-                            Constraint::Min(5),    // Profile list area
-                            Constraint::Length(3), // Input area (when active)
-                        ]
-                        .as_ref(),
-                    )
-                    .split(area);
-
-                // Use the FULL profile list area for maximum size
-                let image_area = chunks[0];
-
-                // Render the image at maximum size
-                render_image_frame(f, image_area, image_path);
-
-                // Always check for overlay text during profile switching, regardless of frame content
-                if let Some(overlay_text) = app.animation_engine.get_overlay_frame() {
-                    render_text_overlay(f, image_area, &overlay_text);
-                }
-                return;
-            } else {
-                app.current_image_path = None;
-                render_animation_frame(f, area, &frame_content);
-                return;
-            }
-        } else {
-            log_debug!("RENDER: No frame content available");
-            app.current_image_path = None;
-        }
-
-        // Even if no frame content, check for overlay text during profile switching
-        if let Some(overlay_text) = app.animation_engine.get_overlay_frame() {
-            // Create layout to get the proper inner pane area
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints(
-                    [
-                        Constraint::Min(5),    // Profile list area
-                        Constraint::Length(3), // Input area (when active)
-                    ]
-                    .as_ref(),
-                )
-                .split(area);
-
-            render_text_overlay(f, chunks[0], &overlay_text);
-        }
+    if let AnimationState::ProfileSwitch {
+        progress,
+        pyramid_scale,
+        llama_offset,
+        cactus_sway,
+        desert_fade,
+    } = app.animation_state
+    {
+        render_profile_switch_animation(f, area, progress, pyramid_scale, llama_offset, cactus_sway, desert_fade);
+        return;
     }
-
+    
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(
-            [
-                Constraint::Min(5),    // Profile list
-                Constraint::Length(3), // Input area (when active)
-            ]
-            .as_ref(),
-        )
+        .constraints([
+            Constraint::Min(5),     // Profile list
+            Constraint::Length(3),  // Input area (when active)
+        ].as_ref())
         .split(area);
-
+    
     // Profile list
-    let profile_items: Vec<ListItem> = app
-        .profile_names
+    let profile_items: Vec<ListItem> = app.profile_names
         .iter()
-        .map(|name| {
-            let mut spans = vec![Span::raw("  ")];
-
+        .enumerate()
+        .map(|(_i, name)| {
+            let mut spans = vec![
+                Span::raw("  "),
+            ];
+            
             // Active profile indicator
             if Some(name) == app.active_profile_name.as_ref() {
                 spans.push(Span::styled("● ", Style::default().fg(Color::Green)));
             } else {
                 spans.push(Span::raw("  "));
             }
-
+            
             spans.push(Span::styled(name, Style::default().fg(Color::Cyan)));
-
+            
             ListItem::new(Line::from(spans))
         })
         .collect();
-
-    let active_profile_text = app
-        .active_profile_name
+    
+    let active_profile_text = app.active_profile_name
         .as_ref()
-        .map(|name| format!(" Active: {name} "))
+        .map(|name| format!(" Active: {} ", name))
         .unwrap_or_else(|| " No Active Profile ".to_string());
-
+    
     let list = List::new(profile_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta))
-                .title(format!(" 🏜️ Lock Profiles 🏜️{active_profile_text}"))
-                .style(Style::default().bg(Color::Rgb(0, 0, 0))),
-        )
-        .highlight_style(
-            Style::default()
-                .bg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        );
-
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta))
+            .title(format!(" 🏜️ Lock Profiles 🏜️{}", active_profile_text))
+            .style(Style::default().bg(Color::Rgb(0, 0, 0))))
+        .highlight_style(Style::default()
+            .bg(Color::Magenta)
+            .add_modifier(Modifier::BOLD));
+    
     f.render_stateful_widget(list, chunks[0], &mut app.profile_list_state);
-
+    
     // Input area (when in input mode)
     if app.profile_input_mode {
         let input_text = match app.profile_action {
             ProfileAction::Save => format!("Save current profile as: {}", app.profile_input_buffer),
             _ => app.profile_input_buffer.clone(),
         };
-
+        
         let input_paragraph = Paragraph::new(input_text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Yellow))
-                    .title(" Enter Profile Name (Enter to save, Esc to cancel) "),
-            )
+            .block(Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Enter Profile Name (Enter to save, Esc to cancel) "))
             .style(Style::default().fg(Color::White));
-
+        
         f.render_widget(input_paragraph, chunks[1]);
     } else {
         // Help text
-        let help_text = vec![Line::from(vec![Span::raw(
-            "Enter: Load | s: Save current | d: Delete | r: Refresh | Up/Down: Navigate",
-        )])];
-
+        let help_text = vec![
+            Line::from(vec![
+                Span::raw("Enter: Load | s: Save current | d: Delete | r: Refresh | Up/Down: Navigate")
+            ])
+        ];
+        
         let help_paragraph = Paragraph::new(help_text)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Gray))
-                    .title(" Commands "),
-            )
+            .block(Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Gray))
+                .title(" Commands "))
             .style(Style::default().fg(Color::Gray));
-
+        
         f.render_widget(help_paragraph, chunks[1]);
     }
 }
 
-fn render_animation_frame(f: &mut ratatui::Frame, area: Rect, content: &str) {
-    // Clear the entire area first
-    let clear_widget = Block::default().style(Style::default().bg(Color::Black));
-    f.render_widget(clear_widget, area);
-
-    // For regular ASCII art
-    let cleaned = content
-        .trim_start_matches("\x1b[?25l") // Remove cursor hide
-        .trim_end_matches("\x1b[?25h") // Remove cursor show
-        .trim_end_matches("\x1b[0m"); // Remove reset
-
-    // Split into lines and render with basic color
-    let lines: Vec<Line> = cleaned
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            // For ANSI art, use green theme
-            if line.contains("\x1b[") {
-                // This has ANSI codes - for now just strip them and show in green
-                let stripped = strip_ansi_escapes::strip(line);
-                let text = String::from_utf8_lossy(&stripped);
-                Line::from(Span::styled(
-                    text.to_string(),
-                    Style::default().fg(Color::Green),
-                ))
-            } else {
-                // Plain text - show in cyan
-                Line::from(Span::styled(line, Style::default().fg(Color::Cyan)))
+fn render_profile_switch_animation(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    progress: f32,
+    pyramid_scale: f32,
+    llama_offset: f32,
+    cactus_sway: f32,
+    desert_fade: f32,
+) {
+    let width = area.width as usize;
+    let height = area.height as usize;
+    
+    // ANSI Shadow style "SWITCH" text
+    let switch_text = vec![
+        "███████╗██╗    ██╗██╗████████╗ ██████╗██╗  ██╗",
+        "██╔════╝██║    ██║██║╚══██╔══╝██╔════╝██║  ██║",
+        "███████╗██║ █╗ ██║██║   ██║   ██║     ███████║",
+        "╚════██║██║███╗██║██║   ██║   ██║     ██╔══██║",
+        "███████║╚███╔███╔╝██║   ██║   ╚██████╗██║  ██║",
+        "╚══════╝ ╚══╝╚══╝ ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝",
+    ];
+    
+    // Custom jungle ASCII art for decoration
+    let jungle_art = vec![
+        "    🌴  🦜  🌿  🌺  🐆  🌿  🦜  🌴    ",
+        "      🌿 🌴 🌿  🦎  🌿 🌴 🌿      ",
+        "    🐒  🌿🌺🌿  🦋  🌿🌺🌿  🐒    ",
+        "      🌴  🌿  🐍  🌿  🌴      ",
+        "    🦜 🌿 🌴 🌿 🦜 🌿 🌴 🌿 🦜    ",
+    ];
+    
+    // Create animated screen
+    let mut lines = Vec::new();
+    
+    // Check if we're in the switch screen phase (middle of animation)
+    let show_switch_screen = progress > 0.3 && progress < 0.7;
+    
+    if show_switch_screen {
+        // Center the SWITCH text
+        let text_width = switch_text[0].chars().count();
+        let text_height = switch_text.len();
+        let x_offset = width.saturating_sub(text_width) / 2;
+        let y_offset = height.saturating_sub(text_height + jungle_art.len() + 4) / 2;
+        
+        for y in 0..height {
+            let mut spans = Vec::new();
+            
+            for x in 0..width {
+                // Draw SWITCH text
+                if y >= y_offset && y < y_offset + text_height && 
+                   x >= x_offset && x < x_offset + text_width {
+                    let text_y = y - y_offset;
+                    let text_x = x - x_offset;
+                    let line_chars: Vec<char> = switch_text[text_y].chars().collect();
+                    if text_x < line_chars.len() {
+                        let ch = line_chars[text_x];
+                        let color = if ch != ' ' {
+                            // Gradient effect based on progress
+                            let intensity = ((progress - 0.3) / 0.4 * 255.0) as u8;
+                            Color::Rgb(intensity, 255 - intensity / 2, 0)
+                        } else {
+                            Color::Reset
+                        };
+                        spans.push(Span::styled(ch.to_string(), Style::default().fg(color)));
+                    } else {
+                        spans.push(Span::raw(" "));
+                    }
+                }
+                // Draw jungle art below SWITCH text
+                else if y >= y_offset + text_height + 2 && 
+                        y < y_offset + text_height + 2 + jungle_art.len() {
+                    let art_y = y - y_offset - text_height - 2;
+                    let art_width = jungle_art[art_y].chars().count();
+                    let art_x_offset = width.saturating_sub(art_width) / 2;
+                    
+                    if x >= art_x_offset && x < art_x_offset + art_width {
+                        let art_x = x - art_x_offset;
+                        let line_chars: Vec<char> = jungle_art[art_y].chars().collect();
+                        if art_x < line_chars.len() {
+                            spans.push(Span::styled(
+                                line_chars[art_x].to_string(),
+                                Style::default().fg(Color::Green)
+                            ));
+                        } else {
+                            spans.push(Span::raw(" "));
+                        }
+                    } else {
+                        spans.push(Span::raw(" "));
+                    }
+                }
+                // Background pattern
+                else {
+                    let bg_char = if (x + y) % 20 == 0 && progress > 0.4 {
+                        "·"
+                    } else if (x * 2 + y) % 30 == 0 && progress > 0.5 {
+                        "˚"
+                    } else {
+                        " "
+                    };
+                    spans.push(Span::styled(bg_char, Style::default().fg(Color::DarkGray)));
+                }
             }
-        })
-        .collect();
-
-    let animation_widget = Paragraph::new(lines)
-        .style(Style::default().bg(Color::Black))
-        .alignment(ratatui::layout::Alignment::Center);
-
-    f.render_widget(animation_widget, area);
-}
-
-fn render_image_frame(f: &mut ratatui::Frame, area: Rect, image_path: &str) {
-    use ratatui_image::{picker::Picker, Image};
-
-    // Clear the entire area first
-    let clear_widget = Block::default().style(Style::default().bg(Color::Black));
-    f.render_widget(clear_widget, area);
-
-    // Use the full area for maximum size
-    let image_area = area;
-
-    // Try to load and display the image (embedded first, then filesystem)
-    let image_result =
-        if let Some(embedded_bytes) = crate::animations::get_embedded_image(image_path) {
-            log_debug!("Using embedded image for: {}", image_path);
-            image::ImageReader::new(std::io::Cursor::new(embedded_bytes))
-                .with_guessed_format()
-                .map_err(|e| format!("Failed to create reader: {e}"))
-                .and_then(|reader| {
-                    reader
-                        .decode()
-                        .map_err(|e| format!("Failed to decode: {e}"))
-                })
-        } else {
-            log_debug!("Using filesystem image for: {}", image_path);
-            image::ImageReader::open(image_path)
-                .map_err(|e| format!("Failed to open: {e}"))
-                .and_then(|reader| {
-                    reader
-                        .decode()
-                        .map_err(|e| format!("Failed to decode: {e}"))
-                })
-        };
-
-    match image_result {
-        Ok(dyn_img) => {
-            // Force using a very small block size for maximum resolution
-            // This gives us 2x2 pixels per character with unicode blocks
-            let mut picker = Picker::new((1, 2));
-
-            // Calculate dimensions to make image width = 100% of panel width
-            let img_width = dyn_img.width() as f64;
-            let img_height = dyn_img.height() as f64;
-            let panel_width = image_area.width as f64;
-
-            // Scale based on width to fill 100% of panel width
-            let width_scale = panel_width / img_width;
-            let new_width = panel_width as u32;
-            let new_height = (img_height * width_scale) as u32;
-
-            // Resize the image to exactly match panel width
-            let resized_img =
-                dyn_img.resize(new_width, new_height, image::imageops::FilterType::Lanczos3);
-
-            // Use the resized image with Fit mode
-            match picker.new_protocol(resized_img, image_area, ratatui_image::Resize::Fit(None)) {
-                Ok(protocol) => {
-                    // Create and render the image widget
-                    let image = Image::new(&*protocol);
-                    f.render_widget(image, image_area);
+            lines.push(Line::from(spans));
+        }
+    } else {
+        // Original desert to jungle transition
+        for y in 0..height {
+            let mut spans = Vec::new();
+            
+            for x in 0..width {
+                // Choose character based on animation progress and position
+                let char_to_show = if progress > 0.7 && y < height / 3 {
+                    // Jungle canopy
+                    if (x + y) % 5 == 0 {
+                        "🌴".to_string()
+                    } else if (x * 2 + y) % 7 == 0 {
+                        "🌿".to_string()
+                    } else {
+                        " ".to_string()
+                    }
+                } else if y < height / 3 {
+                    // Sky area - stars appear based on progress
+                    if (x + y) % 12 == 0 && progress > 0.2 {
+                        "⭐".to_string()
+                    } else if (x + y * 2) % 16 == 0 && progress > 0.4 {
+                        "✦".to_string()
+                    } else {
+                        " ".to_string()
+                    }
+                } else if y < height * 2 / 3 {
+                // Pyramid and desert area
+                let pyramid_center_x = width / 2;
+                let pyramid_y = height / 2;
+                let scaled_size = (8.0 + 4.0 * pyramid_scale) as usize;
+                
+                if y.abs_diff(pyramid_y) < scaled_size / 3 && x.abs_diff(pyramid_center_x) < scaled_size / 2 {
+                    "▲".to_string()
+                } else if x % (12 + ((cactus_sway * 3.0) as usize % 6)) == 3 {
+                    "🌵".to_string()
+                } else if (x + y) % 20 == 0 {
+                    "🪨".to_string()
+                } else {
+                    " ".to_string()
                 }
-                Err(e) => {
-                    log_debug!("Failed to create protocol: {}", e);
-                    show_image_error(f, area, &format!("Failed to create protocol: {e}"));
+            } else {
+                // Ground area
+                if x % 18 == 4 {
+                    "🏜️".to_string()
+                } else if (x * 3) % 25 == 0 {
+                    "⋅".to_string()
+                } else {
+                    " ".to_string()
                 }
+            };
+            
+            // Llama position - moves across screen
+            let llama_x = (width as f32 / 3.0 + llama_offset * 2.0) as usize;
+            let llama_y = height * 3 / 4;
+            
+            if x == llama_x && y == llama_y {
+                spans.push(Span::styled("🦙", Style::default().fg(Color::Rgb(255, 215, 0))));
+            } else {
+                // Color scheme: jungle green transitioning to desert brown
+                let color = if progress > 0.5 {
+                    // Jungle colors
+                    Color::Rgb(
+                        (10 + (progress * 50.0) as u8).min(255),
+                        (80 + (progress * 80.0) as u8).min(255),
+                        (20 + (progress * 40.0) as u8).min(255),
+                    )
+                } else {
+                    // Desert colors
+                    Color::Rgb(
+                        (139 as f32 * desert_fade) as u8,
+                        (100 + (desert_fade * 69.0) as u8).min(255),
+                        (19 + (desert_fade * 40.0) as u8).min(255),
+                    )
+                };
+                spans.push(Span::styled(char_to_show, Style::default().fg(color)));
             }
         }
-        Err(e) => {
-            log_debug!("Failed to load image {}: {}", image_path, e);
-            show_image_error(f, area, &e);
+        
+        lines.push(Line::from(spans));
         }
     }
-}
-
-fn show_image_error(f: &mut ratatui::Frame, area: Rect, error: &str) {
-    let error_msg = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "Image Error",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(error, Style::default().fg(Color::Gray))),
-    ];
-    let error_widget = Paragraph::new(error_msg)
-        .style(Style::default().bg(Color::Black))
-        .alignment(ratatui::layout::Alignment::Center);
-    f.render_widget(error_widget, area);
-}
-
-fn render_text_overlay(f: &mut ratatui::Frame, area: Rect, text: &str) {
-    // Use a larger fixed area for ASCII art display
-    let text_width = 50u16;
-    let text_height = 8u16;
-
-    // Create a centered area for the text
-    let text_area = Rect {
-        x: area.x + (area.width.saturating_sub(text_width)) / 2,
-        y: area.y + (area.height.saturating_sub(text_height)) / 2,
-        width: text_width.min(area.width),
-        height: text_height.min(area.height),
+    
+    // Title based on animation phase
+    let title = if show_switch_screen {
+        " 🎮 Profile Switch 🎮 "
+    } else if progress > 0.7 {
+        " 🌿 Welcome to the Jungle 🌿 "
+    } else {
+        " 🏜️ Leaving the Desert 🏜️ "
     };
-
-    // Create lines from the text with bright yellow color
-    let lines: Vec<Line> = text
-        .lines()
-        .map(|line| {
-            Line::from(Span::styled(
-                line,
-                Style::default()
-                    .fg(Color::Rgb(255, 255, 0))
-                    .add_modifier(Modifier::BOLD),
-            ))
-        })
-        .collect();
-
-    let text_widget = Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center);
-
-    f.render_widget(text_widget, text_area);
+    
+    let animation_paragraph = Paragraph::new(lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(if progress > 0.5 { Color::Green } else { Color::Yellow }))
+            .title(title)
+            .style(Style::default().bg(Color::Rgb(0, 0, 0))));
+    
+    f.render_widget(animation_paragraph, area);
 }
 
 pub fn run_ui(mut app: App) -> Result<App> {
@@ -1721,41 +1902,31 @@ pub fn run_ui(mut app: App) -> Result<App> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Get ignore patterns for the file watcher
-    let watcher_ignore_patterns =
-        if let Ok(state) = crate::state::AppState::load_from_file(&app.state_file) {
-            state.ignore_patterns
-        } else {
-            crate::state::default_ignore_patterns()
-        };
-
     // Set up file watcher
     let (tx, rx) = channel();
-    let mut watcher =
-        notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
-            if let Ok(event) = res {
-                // Filter out events from ignored directories
-                let should_process = event.paths.iter().any(|path| {
-                    let path_str = path.to_string_lossy();
-
-                    // Check against ignore patterns
-                    let ignored = watcher_ignore_patterns.iter().any(|pattern| {
-                        if pattern.ends_with('/') {
-                            path_str.contains(&format!("/{pattern}")) || path_str.contains(pattern)
-                        } else {
-                            path_str.contains(pattern)
-                        }
-                    });
-
-                    !ignored
-                });
-
-                if should_process {
-                    let _ = tx.send(());
+    let state_file_path = app.state_file.clone();
+    let mut watcher = notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
+        if let Ok(event) = res {
+            // Check if the .icaros file was modified
+            let mut is_config_change = false;
+            for path in &event.paths {
+                if path == &state_file_path {
+                    if app.verbose_logging {
+                        log_to_file("UI: Detected change to .icaros file");
+                    }
+                    is_config_change = true;
+                    break;
                 }
             }
-        })?;
-
+            
+            if is_config_change {
+                let _ = tx.send(FileWatchEvent::ConfigChanged);
+            } else {
+                let _ = tx.send(FileWatchEvent::FileChanged);
+            }
+        }
+    })?;
+    
     // Watch the root path
     watcher.watch(&app.root_path, RecursiveMode::Recursive)?;
 
@@ -1774,17 +1945,19 @@ fn get_gradient_color(position: f32, offset: f32, colors: &[Color]) -> Color {
     let index = (wave * (colors.len() - 1) as f32) as usize;
     let next_index = (index + 1).min(colors.len() - 1);
     let t = wave * (colors.len() - 1) as f32 - index as f32;
-
+    
     interpolate_color(colors[index], colors[next_index], t)
 }
 
 fn interpolate_color(c1: Color, c2: Color, t: f32) -> Color {
     match (c1, c2) {
-        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => Color::Rgb(
-            (r1 as f32 + (r2 as f32 - r1 as f32) * t) as u8,
-            (g1 as f32 + (g2 as f32 - g1 as f32) * t) as u8,
-            (b1 as f32 + (b2 as f32 - b1 as f32) * t) as u8,
-        ),
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            Color::Rgb(
+                (r1 as f32 + (r2 as f32 - r1 as f32) * t) as u8,
+                (g1 as f32 + (g2 as f32 - g1 as f32) * t) as u8,
+                (b1 as f32 + (b2 as f32 - b1 as f32) * t) as u8,
+            )
+        },
         _ => c1,
     }
 }
@@ -1793,7 +1966,7 @@ fn get_sky_color(day_night: f32) -> Color {
     let index = (day_night * (SUNSET_GRADIENT.len() - 1) as f32) as usize;
     let next_index = (index + 1).min(SUNSET_GRADIENT.len() - 1);
     let t = day_night * (SUNSET_GRADIENT.len() - 1) as f32 - index as f32;
-
+    
     interpolate_color(SUNSET_GRADIENT[index], SUNSET_GRADIENT[next_index], t)
 }
 
@@ -1810,143 +1983,116 @@ fn get_native_pattern(frame: u64, offset: usize) -> &'static str {
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
-    fs_events: Receiver<()>,
+    fs_events: Receiver<FileWatchEvent>,
 ) -> Result<()> {
     let mut last_tick = Instant::now();
     let tick_rate = Duration::from_millis(50);
-    let debounce_duration = Duration::from_millis(1500); // Increased to handle rapid .venv changes
-
+    let debounce_duration = Duration::from_millis(500);
+    
     loop {
         terminal.draw(|f| {
             // Update animations
             if app.animations_enabled {
                 app.frame_count += 1;
                 app.update_animations(f.area().width);
-                // Update animation engine to clear expired animations
-                app.animation_engine.update();
             }
-
+            
             // Update profile animation if active
             if app.profile_switching {
                 app.update_profile_animation();
             }
-
+            
+            // Check for monitor events
+            app.check_monitor_events();
+            
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints(
-                    [
-                        Constraint::Length(3), // Top title bar
-                        Constraint::Min(0),    // Main content area
-                    ]
-                    .as_ref(),
-                )
+                .constraints([
+                    Constraint::Length(3),  // Top title bar
+                    Constraint::Min(0),     // Main content area
+                ].as_ref())
                 .split(f.area());
 
             // Create animated title with gradient background
             let mut title_spans = Vec::new();
             let width = chunks[0].width as usize;
-
+            
             if app.animations_enabled {
                 // Create gradient background
                 let sky_color = get_sky_color(app.day_night_cycle);
                 let (time_emoji, time_name) = get_time_emoji(app.day_night_cycle);
-
+                
                 // Build the title line with gradient effect
                 for i in 0..width {
                     let x = i as f32 / width as f32;
-                    let gradient_color =
-                        get_gradient_color(x * 10.0, app.wave_offset, EARTH_COLORS);
-
+                    let gradient_color = get_gradient_color(x * 10.0, app.wave_offset, EARTH_COLORS);
+                    
                     // Place llama
                     if i as f32 >= app.llama_x && (i as f32) < app.llama_x + 2.0 {
-                        title_spans.push(Span::styled(
-                            "🦙",
-                            Style::default().fg(Color::White).bg(sky_color),
-                        ));
+                        title_spans.push(Span::styled("🦙", Style::default().fg(Color::White).bg(sky_color)));
                     }
                     // Place desert elements
                     else if i % 15 == 0 && i > 0 && i < width - 5 {
                         let desert_elem = DESERT_ELEMENTS[(i / 15) % DESERT_ELEMENTS.len()];
-                        title_spans.push(Span::styled(
-                            desert_elem,
-                            Style::default().fg(gradient_color).bg(sky_color),
-                        ));
+                        title_spans.push(Span::styled(desert_elem, Style::default().fg(gradient_color).bg(sky_color)));
                     }
                     // Place time emoji
                     else if i == width - 10 {
-                        title_spans.push(Span::styled(
-                            time_emoji,
-                            Style::default().fg(Color::White).bg(sky_color),
-                        ));
+                        title_spans.push(Span::styled(time_emoji, Style::default().fg(Color::White).bg(sky_color)));
                     }
                     // Native patterns
                     else if i % 8 == 0 {
                         let pattern = get_native_pattern(app.frame_count, i);
-                        title_spans.push(Span::styled(
-                            pattern,
-                            Style::default().fg(gradient_color).bg(sky_color),
-                        ));
-                    } else {
+                        title_spans.push(Span::styled(pattern, Style::default().fg(gradient_color).bg(sky_color)));
+                    }
+                    else {
                         title_spans.push(Span::styled(" ", Style::default().bg(sky_color)));
                     }
                 }
-
+                
                 // Title text overlay
                 let title_text = "◈ I C A R O S ◈";
                 let title_start = (width / 2).saturating_sub(title_text.len() / 2);
                 for (i, ch) in title_text.chars().enumerate() {
                     if title_start + i < title_spans.len() {
-                        let pulse =
-                            ((app.frame_count as f32 * 0.05 + i as f32 * 0.3).sin() + 1.0) / 2.0;
+                        let pulse = ((app.frame_count as f32 * 0.05 + i as f32 * 0.3).sin() + 1.0) / 2.0;
                         let text_color = interpolate_color(
                             Color::Rgb(255, 255, 255),
                             Color::Rgb(255, 215, 0),
-                            pulse,
+                            pulse
                         );
                         title_spans[title_start + i] = Span::styled(
-                            ch.to_string(),
-                            Style::default()
-                                .fg(text_color)
-                                .bg(sky_color)
-                                .add_modifier(Modifier::BOLD),
+                            ch.to_string(), 
+                            Style::default().fg(text_color).bg(sky_color).add_modifier(Modifier::BOLD)
                         );
                     }
                 }
-
+                
                 // Add subtitle
-                let subtitle = format!(" {time_name} Journey ");
+                let subtitle = format!(" {} Journey ", time_name);
                 let _subtitle_start = (width / 2).saturating_sub(subtitle.len() / 2);
                 let _subtitle_y = 2; // This would need to be on a second line
             } else {
                 // Static title
-                let static_line = format!(
-                    "{:^width$}",
-                    "◈ I C A R O S ◈ - Stop AI Agents from Going on Vision Quests",
-                    width = width
-                );
-                title_spans.push(Span::styled(
-                    static_line,
-                    Style::default().fg(Color::Rgb(255, 215, 0)),
-                ));
+                let static_line = format!("{:^width$}", "◈ I C A R O S ◈ - Stop AI Agents from Going on Vision Quests", width = width);
+                title_spans.push(Span::styled(static_line, Style::default().fg(Color::Rgb(255, 215, 0))));
             }
-
+            
             let title = vec![Line::from(title_spans)];
             let title_widget = Paragraph::new(title)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(if app.animations_enabled {
-                            get_gradient_color(0.0, app.wave_offset * 2.0, EARTH_COLORS)
-                        } else {
-                            Color::Rgb(210, 105, 30) // Static chocolate
-                        }))
-                        .style(Style::default()),
-                )
+                .block(Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(if app.animations_enabled {
+                        get_gradient_color(0.0, app.wave_offset * 2.0, EARTH_COLORS)
+                    } else {
+                        Color::Rgb(210, 105, 30)  // Static chocolate
+                    }))
+                    .style(Style::default()))
                 .alignment(ratatui::layout::Alignment::Center);
             f.render_widget(title_widget, chunks[0]);
 
             // No more floating emojis in the main area
-
+            
             // Check if help overlay should be shown
             if app.show_help {
                 render_help_overlay(f, app, chunks[1]);
@@ -1954,18 +2100,15 @@ fn run_app<B: ratatui::backend::Backend>(
                 // Split main area for tabs
                 let main_chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints(
-                        [
-                            Constraint::Length(1), // Compact tab bar
-                            Constraint::Min(0),    // Content
-                        ]
-                        .as_ref(),
-                    )
+                    .constraints([
+                        Constraint::Length(1), // Compact tab bar
+                        Constraint::Min(0),    // Content
+                    ].as_ref())
                     .split(chunks[1]);
-
+                
                 // Render compact tabs
                 render_compact_tabs(f, app, main_chunks[0]);
-
+                
                 // Render content based on active tab
                 match app.active_tab {
                     TabIndex::FileGuardian => {
@@ -1978,55 +2121,57 @@ fn run_app<B: ratatui::backend::Backend>(
                         render_profiles(f, app, main_chunks[1]);
                     }
                 }
-
-                // Render simple animations on top (but not profile switch - that's handled in render_profiles)
-                if app.animations_enabled
-                    && app.animation_engine.is_active()
-                    && !app.profile_switching
-                {
-                    if let Some(frame_content) = app.animation_engine.get_current_frame() {
-                        // Create a larger overlay that covers most of the content area
-                        let overlay_height = std::cmp::min(20, chunks[1].height);
-                        let overlay_width = std::cmp::min(50, chunks[1].width);
-                        let overlay_area = Rect {
-                            x: chunks[1].x + chunks[1].width / 2 - overlay_width / 2,
-                            y: chunks[1].y + chunks[1].height / 2 - overlay_height / 2,
-                            width: overlay_width,
-                            height: overlay_height,
-                        };
-                        render_animation_frame(f, overlay_area, &frame_content);
-                    }
-                }
+                
+                // Monitor status is now shown via shield icon in tab/title
             }
         })?;
 
         // Check for file system events (non-blocking)
-        if fs_events.try_recv().is_ok() {
-            // Set flag to refresh, but debounce to avoid too many updates
-            if app.last_refresh.elapsed() > debounce_duration {
-                app.needs_refresh = true;
+        if let Ok(event) = fs_events.try_recv() {
+            match event {
+                FileWatchEvent::FileChanged => {
+                    // Set flag to refresh, but debounce to avoid too many updates
+                    if app.last_refresh.elapsed() > debounce_duration {
+                        app.needs_refresh = true;
+                    }
+                }
+                FileWatchEvent::ConfigChanged => {
+                    if app.verbose_logging {
+                        log_to_file("UI: Handling config change event");
+                    }
+                    // Reload the blocked processes from the config file
+                    if app.enable_monitoring && app.monitor.is_some() {
+                        if let Ok(state) = crate::state::AppState::load_from_file(&app.state_file) {
+                            if app.verbose_logging {
+                                log_to_file(&format!("UI: Reloading blocked processes: {:?}", state.blocked_processes));
+                            }
+                            
+                            // Update the monitor with new blocked processes
+                            if let Some(ref monitor) = app.monitor {
+                                if let Err(e) = monitor.update_monitored_processes(state.blocked_processes.clone()) {
+                                    log_to_file(&format!("UI: Failed to update monitored processes: {}", e));
+                                    app.monitor_events.push(fs_monitor::GuardianEvent::MonitorError(
+                                        format!("Failed to update monitored processes: {}", e)
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
-
+        
         // Refresh tree if needed
         if app.needs_refresh && app.last_refresh.elapsed() > debounce_duration {
-            match app.refresh_tree() {
-                Ok(_) => {
-                    // Refresh successful
-                }
-                Err(e) => {
-                    // More graceful error handling - just log and reset flag
-                    eprintln!("Warning: Tree refresh encountered issues: {e}");
-                    app.needs_refresh = false;
-                    app.last_refresh = Instant::now();
-                }
+            if let Err(e) = app.refresh_tree() {
+                eprintln!("Error refreshing tree: {}", e);
             }
         }
-
+        
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
-
+            
         if crossterm::event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 // Global keys
@@ -2038,9 +2183,7 @@ fn run_app<B: ratatui::backend::Backend>(
                             TabIndex::FileGuardian => {
                                 // Initialize Git view when switching to it
                                 app.refresh_git_status();
-                                if !app.git_files.is_empty()
-                                    && app.git_selected_file < app.git_files.len()
-                                {
+                                if !app.git_files.is_empty() && app.git_selected_file < app.git_files.len() {
                                     app.load_git_diff();
                                 }
                                 TabIndex::GitStage
@@ -2062,9 +2205,7 @@ fn run_app<B: ratatui::backend::Backend>(
                             TabIndex::Profiles => {
                                 // Initialize Git view when switching to it
                                 app.refresh_git_status();
-                                if !app.git_files.is_empty()
-                                    && app.git_selected_file < app.git_files.len()
-                                {
+                                if !app.git_files.is_empty() && app.git_selected_file < app.git_files.len() {
                                     app.load_git_diff();
                                 }
                                 TabIndex::GitStage
@@ -2074,22 +2215,47 @@ fn run_app<B: ratatui::backend::Backend>(
                     _ => {
                         // Tab-specific keys
                         match app.active_tab {
-                            TabIndex::FileGuardian => match key.code {
-                                KeyCode::Up => app.move_up(),
-                                KeyCode::Down => app.move_down(),
-                                KeyCode::Char(' ') => app.toggle_selected(),
-                                KeyCode::Enter => app.toggle_expand_selected(),
-                                KeyCode::Char('c') => app.toggle_create_in_locked_selected(),
-                                KeyCode::Char('a') => {
-                                    app.animations_enabled = !app.animations_enabled
+                            TabIndex::FileGuardian => {
+                                match key.code {
+                                    KeyCode::Up => app.move_up(),
+                                    KeyCode::Down => app.move_down(),
+                                    KeyCode::Char(' ') => app.toggle_selected(),
+                                    KeyCode::Enter => app.toggle_expand_selected(),
+                                    KeyCode::Char('c') => app.toggle_create_in_locked_selected(),
+                                    KeyCode::Char('a') => app.animations_enabled = !app.animations_enabled,
+                                    KeyCode::Char('r') => app.needs_refresh = true,
+                                    KeyCode::Char('h') => {
+                                        app.show_hidden = !app.show_hidden;
+                                        app.update_items();
+                                    }
+                                    // KeyCode::Char('m') => {
+                                    //     log_to_file("UI: 'm' key pressed, calling toggle_monitoring");
+                                    //     app.toggle_monitoring();
+                                    // }
+                                    KeyCode::Char('b') => {
+                                        // Show blocked processes (for now just log them)
+                                        log_to_file("UI: 'b' key pressed, showing blocked processes");
+                                        if let Ok(state) = crate::state::AppState::load_from_file(&app.state_file) {
+                                            let mut message = "🚫 Blocked Processes:\n".to_string();
+                                            if state.blocked_processes.is_empty() {
+                                                message.push_str("  (none)");
+                                            } else {
+                                                for process in &state.blocked_processes {
+                                                    message.push_str(&format!("  - {}\n", process));
+                                                }
+                                            }
+                                            message.push_str("\nEdit .icaros file to modify blocked processes");
+                                            
+                                            // Add as a monitor event for display
+                                            #[cfg(target_os = "macos")]
+                                            app.monitor_events.push(fs_monitor::GuardianEvent::MonitorError(message));
+                                            #[cfg(not(target_os = "macos"))]
+                                            app.monitor_events.push(message);
+                                        }
+                                    }
+                                    _ => {}
                                 }
-                                KeyCode::Char('r') => app.needs_refresh = true,
-                                KeyCode::Char('h') => {
-                                    app.show_hidden = !app.show_hidden;
-                                    app.update_items();
-                                }
-                                _ => {}
-                            },
+                            }
                             TabIndex::GitStage => {
                                 match key.code {
                                     KeyCode::Left => app.git_pane = GitPane::FileList,
@@ -2098,14 +2264,18 @@ fn run_app<B: ratatui::backend::Backend>(
                                             app.git_pane = GitPane::DiffView;
                                         }
                                     }
-                                    KeyCode::Up => match app.git_pane {
-                                        GitPane::FileList => app.move_git_file_up(),
-                                        GitPane::DiffView => app.scroll_git_diff_up(),
-                                    },
-                                    KeyCode::Down => match app.git_pane {
-                                        GitPane::FileList => app.move_git_file_down(),
-                                        GitPane::DiffView => app.scroll_git_diff_down(),
-                                    },
+                                    KeyCode::Up => {
+                                        match app.git_pane {
+                                            GitPane::FileList => app.move_git_file_up(),
+                                            GitPane::DiffView => app.scroll_git_diff_up(),
+                                        }
+                                    }
+                                    KeyCode::Down => {
+                                        match app.git_pane {
+                                            GitPane::FileList => app.move_git_file_down(),
+                                            GitPane::DiffView => app.scroll_git_diff_down(),
+                                        }
+                                    }
                                     KeyCode::Char(' ') => {
                                         if app.git_pane == GitPane::FileList {
                                             app.toggle_git_file_stage();
@@ -2123,17 +2293,13 @@ fn run_app<B: ratatui::backend::Backend>(
                                     }
                                     KeyCode::Char('s') => {
                                         // Stage current hunk (not implemented yet)
-                                        if app.git_pane == GitPane::DiffView
-                                            && !app.git_diff_hunks.is_empty()
-                                        {
+                                        if app.git_pane == GitPane::DiffView && !app.git_diff_hunks.is_empty() {
                                             // TODO: Implement hunk staging
                                         }
                                     }
                                     KeyCode::Char('u') => {
                                         // Unstage current hunk (not implemented yet)
-                                        if app.git_pane == GitPane::DiffView
-                                            && !app.git_diff_hunks.is_empty()
-                                        {
+                                        if app.git_pane == GitPane::DiffView && !app.git_diff_hunks.is_empty() {
                                             // TODO: Implement hunk unstaging
                                         }
                                     }
@@ -2168,10 +2334,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                     match key.code {
                                         KeyCode::Up => app.move_profile_up(),
                                         KeyCode::Down => app.move_profile_down(),
-                                        KeyCode::Enter => {
-                                            log_debug!("UI: Enter key pressed in profiles tab");
-                                            app.load_selected_profile();
-                                        }
+                                        KeyCode::Enter => app.load_selected_profile(),
                                         KeyCode::Char('s') => {
                                             app.profile_action = ProfileAction::Save;
                                             app.profile_input_mode = true;
@@ -2192,7 +2355,7 @@ fn run_app<B: ratatui::backend::Backend>(
                 }
             }
         }
-
+        
         if last_tick.elapsed() >= tick_rate {
             last_tick = Instant::now();
         }
@@ -2200,47 +2363,130 @@ fn run_app<B: ratatui::backend::Backend>(
     Ok(())
 }
 
-fn render_compact_tabs(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let tab_titles = match app.active_tab {
-        TabIndex::FileGuardian => " 🦙 File Guardian | Git Stage | Profiles ",
-        TabIndex::GitStage => " File Guardian | 🔧 Git Stage | Profiles ",
-        TabIndex::Profiles => " File Guardian | Git Stage | 🏜️ Profiles ",
+fn render_compact_tabs(
+    f: &mut ratatui::Frame,
+    app: &App,
+    area: Rect,
+) {
+    let guardian_tab = if app.monitor.is_some() {
+        " 🦙🛡️ File Guardian "
+    } else {
+        " 🦙 File Guardian "
     };
-
+    
+    let tab_titles = match app.active_tab {
+        TabIndex::FileGuardian => format!("{}| Git Stage | Profiles ", guardian_tab),
+        TabIndex::GitStage => format!("{}| 🔧 Git Stage | Profiles ", guardian_tab),
+        TabIndex::Profiles => format!("{}| Git Stage | 🏜️ Profiles ", guardian_tab),
+    };
+    
     let tab_line = Line::from(vec![
-        Span::styled(
-            "◈ I C A R O S ◈",
-            Style::default()
-                .fg(Color::Rgb(255, 215, 0))
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("◈ I C A R O S ◈", Style::default()
+            .fg(Color::Rgb(255, 215, 0))
+            .add_modifier(Modifier::BOLD)),
         Span::raw(" - "),
-        Span::styled(
-            tab_titles,
-            Style::default()
-                .fg(Color::Rgb(0, 206, 209))
-                .add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(tab_titles, Style::default()
+            .fg(Color::Rgb(0, 206, 209))
+            .add_modifier(Modifier::BOLD)),
         Span::styled(" [? for help]", Style::default().fg(Color::Gray)),
     ]);
-
-    let tab_widget = Paragraph::new(vec![tab_line]).style(Style::default().bg(Color::Rgb(0, 0, 0)));
-
+    
+    let tab_widget = Paragraph::new(vec![tab_line])
+        .style(Style::default().bg(Color::Rgb(0, 0, 0)));
+    
     f.render_widget(tab_widget, area);
 }
 
-fn render_help_overlay(f: &mut ratatui::Frame, app: &App, area: Rect) {
+fn render_monitor_notifications(
+    f: &mut ratatui::Frame,
+    app: &App,
+    area: Rect,
+) {
+    #[cfg(target_os = "macos")]
+    use fs_monitor::GuardianEvent;
+    
+    // Create a small notification area at the bottom
+    let notification_height = std::cmp::min(5, app.monitor_events.len() + 2) as u16;
+    let notification_area = Rect {
+        x: area.x + 2,
+        y: area.y + area.height.saturating_sub(notification_height + 2),
+        width: area.width.saturating_sub(4),
+        height: notification_height,
+    };
+    
+    let mut lines = vec![
+        Line::from(Span::styled("🛡️ Monitor Notifications", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
+    ];
+    
+    // Show last few events
+    #[cfg(target_os = "macos")]
+    {
+        for event in app.monitor_events.iter().rev().take(3) {
+            let line = match event {
+                GuardianEvent::BlockedWrite { path, process, .. } => {
+                    Line::from(vec![
+                        Span::styled("🚫 Blocked: ", Style::default().fg(Color::Red)),
+                        Span::raw(format!("{} tried to write ", process)),
+                        Span::styled(path.file_name().unwrap_or_default().to_string_lossy().to_string(), Style::default().fg(Color::Cyan)),
+                    ])
+                }
+                GuardianEvent::BlockedDelete { path, process, .. } => {
+                    Line::from(vec![
+                        Span::styled("🗑️ Blocked: ", Style::default().fg(Color::Red)),
+                        Span::raw(format!("{} tried to delete ", process)),
+                        Span::styled(path.file_name().unwrap_or_default().to_string_lossy().to_string(), Style::default().fg(Color::Cyan)),
+                    ])
+                }
+                GuardianEvent::StashedChange { path, .. } => {
+                    Line::from(vec![
+                        Span::styled("📦 Stashed: ", Style::default().fg(Color::Green)),
+                        Span::styled(path.file_name().unwrap_or_default().to_string_lossy().to_string(), Style::default().fg(Color::Cyan)),
+                    ])
+                }
+                GuardianEvent::MonitorStarted => {
+                    Line::from(Span::styled("✅ Monitor started", Style::default().fg(Color::Green)))
+                }
+                GuardianEvent::MonitorStopped => {
+                    Line::from(Span::styled("⏹️ Monitor stopped", Style::default().fg(Color::Yellow)))
+                }
+                GuardianEvent::MonitorError(msg) => {
+                    Line::from(Span::styled(format!("❌ {}", msg), Style::default().fg(Color::Red)))
+                }
+                _ => continue,
+            };
+            lines.push(line);
+        }
+    }
+    
+    #[cfg(not(target_os = "macos"))]
+    {
+        for msg in app.monitor_events.iter().rev().take(3) {
+            lines.push(Line::from(Span::styled(msg.clone(), Style::default().fg(Color::Yellow))));
+        }
+    }
+    
+    let notification_widget = Paragraph::new(lines)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .style(Style::default().bg(Color::Rgb(20, 20, 20))));
+    
+    f.render_widget(notification_widget, notification_area);
+}
+
+fn render_help_overlay(
+    f: &mut ratatui::Frame,
+    app: &App,
+    area: Rect,
+) {
     // Create a centered popup
     let popup_area = centered_rect(80, 80, area);
-
+    
     let help_content = match app.active_tab {
         TabIndex::FileGuardian => vec![
-            Line::from(Span::styled(
-                "🦙 File Guardian Help",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Line::from(Span::styled("🦙 File Guardian Help", Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD))),
             Line::from(""),
             Line::from("Navigation:"),
             Line::from("  ↑↓        Navigate files"),
@@ -2253,6 +2499,7 @@ fn render_help_overlay(f: &mut ratatui::Frame, app: &App, area: Rect) {
             Line::from("  h         Show/hide hidden files"),
             Line::from("  r         Refresh file tree"),
             Line::from("  a         Toggle animations"),
+            Line::from("  m         Toggle file monitoring (requires sudo)"),
             Line::from(""),
             Line::from("Visual Indicators:"),
             Line::from("  🔒        Locked file/directory"),
@@ -2264,12 +2511,9 @@ fn render_help_overlay(f: &mut ratatui::Frame, app: &App, area: Rect) {
             Line::from("  q         Quit"),
         ],
         TabIndex::GitStage => vec![
-            Line::from(Span::styled(
-                "🔧 Git Stage Help",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Line::from(Span::styled("🔧 Git Stage Help", Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD))),
             Line::from(""),
             Line::from("Navigation:"),
             Line::from("  ←→        Switch between file list and diff"),
@@ -2298,12 +2542,9 @@ fn render_help_overlay(f: &mut ratatui::Frame, app: &App, area: Rect) {
             Line::from("  q         Quit"),
         ],
         TabIndex::Profiles => vec![
-            Line::from(Span::styled(
-                "🏜️ Profile Management Help",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            Line::from(Span::styled("🏜️ Profile Management Help", Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD))),
             Line::from(""),
             Line::from("Navigation:"),
             Line::from("  ↑↓        Navigate profiles"),
@@ -2328,23 +2569,22 @@ fn render_help_overlay(f: &mut ratatui::Frame, app: &App, area: Rect) {
             Line::from("  q         Quit"),
         ],
     };
-
+    
     let help_widget = Paragraph::new(help_content)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(" Help - Press ? to close ")
-                .style(Style::default().bg(Color::Rgb(0, 0, 0))),
-        )
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(" Help - Press ? to close ")
+            .style(Style::default().bg(Color::Rgb(0, 0, 0))))
         .wrap(ratatui::widgets::Wrap { trim: true });
-
+    
     // Clear the background
     f.render_widget(
-        Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0))),
-        popup_area,
+        Block::default()
+            .style(Style::default().bg(Color::Rgb(0, 0, 0))),
+        popup_area
     );
-
+    
     f.render_widget(help_widget, popup_area);
 }
 

@@ -6,6 +6,10 @@ mod git;
 mod logger;
 mod state;
 mod ui;
+#[cfg(target_os = "macos")]
+mod fs_monitor;
+#[cfg(target_os = "macos")]
+mod stash;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -26,6 +30,9 @@ struct Args {
 
     #[arg(short, long, help = "Additional ignore patterns")]
     ignore: Vec<String>,
+
+    #[arg(short = 'v', long, help = "Enable verbose logging")]
+    verbose: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -69,7 +76,7 @@ fn main() -> Result<()> {
 
             let tree = file_tree::build_tree(&root_path, &ignore_patterns, false)?;
 
-            let mut app = ui::App::new(tree, state_file.clone(), root_path.clone());
+            let mut app = ui::App::new(tree, state_file.clone(), root_path.clone(), args.verbose);
 
             if state_file.exists() {
                 if let Ok(state) = state::AppState::load_from_file(&state_file) {
