@@ -45,6 +45,7 @@ pub struct MonitorConfig {
     pub block_timeout: Duration,
     pub auto_stash: bool,
     pub monitored_processes: Vec<String>,
+    pub allowed_processes: Vec<String>,
     pub block_mode: BlockMode,
     pub verbose: bool,
 }
@@ -258,6 +259,14 @@ impl FsGuardianMonitor {
         Ok(())
     }
     
+    pub fn update_allowed_processes(&self, processes: Vec<String>) -> Result<()> {
+        let mut config = self.config.write().unwrap();
+        log_to_file(&format!("MONITOR: Updating allowed processes from {:?} to {:?}", 
+                           config.allowed_processes, processes));
+        config.allowed_processes = processes;
+        Ok(())
+    }
+    
     pub fn events(&self) -> &Receiver<GuardianEvent> {
         &self.event_rx
     }
@@ -286,9 +295,53 @@ impl FsGuardianMonitor {
             }
         }
         
-        // Check if this is from a monitored process
+        // Check if this process is allowed (supersedes blocked list)
+        let process_name_lower = event.process_name.to_lowercase();
+        let is_allowed = config_guard.allowed_processes.iter()
+            .any(|p| process_name_lower.contains(&p.to_lowercase()));
+        
+        if is_allowed {
+            if event.process_name != "icaros" && event.process_name != "Finder" {
+                if verbose {
+                    log_to_file(&format!("DEBUG: Process '{}' is in allowed list - allowing", event.process_name));
+                }
+            }
+            drop(config_guard); // Drop the guard before returning
+            
+            // IMPORTANT: Update backup for allowed processes
+            // This ensures we keep track of latest allowed changes
+            if event.operation.contains("write") || event.operation.contains("WrData") || 
+               event.operation.contains("close") || event.operation.contains("truncate") {
+                
+                let event_path = PathBuf::from(&event.path);
+                
+                // Wait a bit for the write to complete
+                thread::sleep(Duration::from_millis(50));
+                
+                // Update the backup with the new content
+                if event_path.exists() && event_path.is_file() {
+                    if let Ok(new_content) = fs::read(&event_path) {
+                        let mut backups = file_backups.write().unwrap();
+                        let old_size = backups.get(&event_path).map(|b| b.len()).unwrap_or(0);
+                        backups.insert(event_path.clone(), new_content.clone());
+                        if event.process_name != "icaros" && event.process_name != "Finder" {
+                            // Re-check verbose flag after dropping guard
+                            let verbose = config.read().unwrap().verbose;
+                            if verbose {
+                                log_to_file(&format!("BACKUP: Updated backup for {:?} after allowed process write ({} -> {} bytes)", 
+                                                   event_path, old_size, new_content.len()));
+                            }
+                        }
+                    }
+                }
+            }
+            
+            return Ok(());
+        }
+        
+        // Check if this is from a monitored (blocked) process - case insensitive
         let is_monitored = config_guard.monitored_processes.is_empty() || 
-            config_guard.monitored_processes.iter().any(|p| event.process_name.contains(p));
+            config_guard.monitored_processes.iter().any(|p| process_name_lower.contains(&p.to_lowercase()));
         
         if !is_monitored {
             if event.process_name != "icaros" && event.process_name != "Finder" {
@@ -737,6 +790,7 @@ impl Default for MonitorConfig {
                 "vim".to_string(),
                 "nvim".to_string(),
             ],
+            allowed_processes: vec![],
             block_mode: BlockMode::Revert,
             verbose: false,
         }

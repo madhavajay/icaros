@@ -28,9 +28,19 @@ pub fn default_ignore_patterns() -> Vec<String> {
 
 fn default_blocked_processes() -> Vec<String> {
     vec![
-        // Default: just block Claude AI assistants
-        "claude".to_string(),
-        "Claude".to_string(),
+        "node".to_string(),
+        "cursor".to_string(),
+        "vim".to_string(),
+        "bash".to_string(),
+        "zsh".to_string(),
+        "sh".to_string(),
+    ]
+}
+
+fn default_allowed_processes() -> Vec<String> {
+    vec![
+        "cursor".to_string(),
+        "vscode".to_string(),
     ]
 }
 
@@ -66,6 +76,9 @@ pub struct AppState {
     
     #[serde(default = "default_blocked_processes")]
     pub blocked_processes: Vec<String>,
+    
+    #[serde(default = "default_allowed_processes")]
+    pub allowed_processes: Vec<String>,
 
     // File system ignore patterns
     #[serde(default = "default_ignore_patterns")]
@@ -83,6 +96,7 @@ impl AppState {
             allow_create_patterns: Vec::new(),
             expanded_dirs: Vec::new(),
             blocked_processes: default_blocked_processes(),
+            allowed_processes: default_allowed_processes(),
             ignore_patterns: default_ignore_patterns(),
         }
     }
@@ -123,20 +137,21 @@ impl AppState {
         yaml.push_str("allow_create_patterns: []\n\n");
         
         // Blocked processes with examples
-        yaml.push_str("# Processes to block when they try to modify locked files\n");
+        yaml.push_str("# Processes to block when they try to modify locked files (case-insensitive)\n");
         yaml.push_str("blocked_processes:\n");
         for process in &self.blocked_processes {
             yaml.push_str(&format!("  - \"{}\"\n", process));
         }
         
-        yaml.push_str("\n# Additional processes you can block (uncomment to enable):\n");
-        yaml.push_str("# - \"cursor\"      # Cursor editor\n");
-        yaml.push_str("# - \"Cursor\"      # Cursor editor (capitalized)\n");
+        yaml.push_str("\n# Processes allowed to modify locked files (supersedes blocked list, case-insensitive)\n");
+        yaml.push_str("allowed_processes:\n");
+        for process in &self.allowed_processes {
+            yaml.push_str(&format!("  - \"{}\"\n", process));
+        }
+        
+        yaml.push_str("\n# Additional processes you can add:\n");
         yaml.push_str("# - \"code\"        # VS Code\n");
-        yaml.push_str("# - \"Code\"        # VS Code (capitalized)\n");
         yaml.push_str("# - \"copilot\"     # GitHub Copilot\n");
-        yaml.push_str("# - \"Copilot\"     # GitHub Copilot (capitalized)\n");
-        yaml.push_str("# - \"vim\"         # Vim editor (useful for testing)\n");
         yaml.push_str("# - \"nvim\"        # Neovim editor\n");
         yaml.push_str("# - \"nano\"        # Nano editor\n");
         yaml.push_str("# - \"emacs\"       # Emacs editor\n\n");

@@ -626,19 +626,24 @@ impl App {
                 log_to_file("UI: Creating monitor with config from state");
                 
                 // Load blocked processes from state file
-                let blocked_processes = if let Ok(state) = crate::state::AppState::load_from_file(&self.state_file) {
+                let (blocked_processes, allowed_processes) = if let Ok(state) = crate::state::AppState::load_from_file(&self.state_file) {
                     log_to_file(&format!("UI: Loaded {} blocked processes from state", state.blocked_processes.len()));
                     for process in &state.blocked_processes {
                         log_to_file(&format!("  - Blocking: {}", process));
                     }
-                    state.blocked_processes
+                    log_to_file(&format!("UI: Loaded {} allowed processes from state", state.allowed_processes.len()));
+                    for process in &state.allowed_processes {
+                        log_to_file(&format!("  - Allowing: {}", process));
+                    }
+                    (state.blocked_processes, state.allowed_processes)
                 } else {
                     log_to_file("UI: Using default blocked processes");
-                    vec!["vim".to_string(), "nvim".to_string()]
+                    (vec!["vim".to_string(), "nvim".to_string()], vec![])
                 };
                 
                 let mut config = fs_monitor::MonitorConfig::default();
                 config.monitored_processes = blocked_processes;
+                config.allowed_processes = allowed_processes;
                 config.verbose = self.verbose_logging;
                 
                 match fs_monitor::FsGuardianMonitor::new(config, self.root_path.clone()) {
@@ -2146,12 +2151,18 @@ fn run_app<B: ratatui::backend::Backend>(
                                 log_to_file(&format!("UI: Reloading blocked processes: {:?}", state.blocked_processes));
                             }
                             
-                            // Update the monitor with new blocked processes
+                            // Update the monitor with new blocked and allowed processes
                             if let Some(ref monitor) = app.monitor {
                                 if let Err(e) = monitor.update_monitored_processes(state.blocked_processes.clone()) {
                                     log_to_file(&format!("UI: Failed to update monitored processes: {}", e));
                                     app.monitor_events.push(fs_monitor::GuardianEvent::MonitorError(
                                         format!("Failed to update monitored processes: {}", e)
+                                    ));
+                                }
+                                if let Err(e) = monitor.update_allowed_processes(state.allowed_processes.clone()) {
+                                    log_to_file(&format!("UI: Failed to update allowed processes: {}", e));
+                                    app.monitor_events.push(fs_monitor::GuardianEvent::MonitorError(
+                                        format!("Failed to update allowed processes: {}", e)
                                     ));
                                 }
                             }
@@ -2226,7 +2237,7 @@ fn run_app<B: ratatui::backend::Backend>(
                                     KeyCode::Char('r') => app.needs_refresh = true,
                                     KeyCode::Char('h') => {
                                         app.show_hidden = !app.show_hidden;
-                                        app.update_items();
+                                        app.needs_refresh = true;
                                     }
                                     // KeyCode::Char('m') => {
                                     //     log_to_file("UI: 'm' key pressed, calling toggle_monitoring");
