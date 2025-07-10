@@ -28,7 +28,13 @@ anyhow = "1.0"
 notify = "6.1"
 dirs = "5.0"
 git2 = { version = "0.18", features = ["vendored-openssl"] }
-chrono = "0.4.41"
+chrono = { version = "0.4.41", features = ["serde"] }
+fs_usage_sys = "0.1.4"
+tokio = { version = "1.0", features = ["full"] }
+crossbeam-channel = "0.5"
+libc = "0.2"
+sha2 = "0.10"
+hex = "0.4"
 rand = "0.8"
 strip-ansi-escapes = "0.2"
 image = "0.25"
@@ -38,3 +44,8 @@ ratatui-image = "2.0"
 assert_cmd = "2.0"
 predicates = "3.0"
 tempfile = "3.8"
+
+# For local development of fs_usage_sys
+# Uncomment the following lines to use the local version instead of crates.io
+# [patch.crates-io]
+# fs_usage_sys = { path = "/Users/madhavajay/dev/fs_usage_sys" }

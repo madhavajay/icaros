@@ -4,3 +4,9 @@ pub mod git;
 pub mod logger;
 pub mod state;
 pub mod ui;
+#[cfg(target_os = "macos")]
+pub mod fs_monitor;
+#[cfg(target_os = "macos")]
+pub mod fs_monitor_option2;
+#[cfg(target_os = "macos")]
+pub mod stash;
