@@ -290,6 +290,13 @@ impl FsGuardianMonitor {
         let is_monitored = config_guard.monitored_processes.is_empty() || 
             config_guard.monitored_processes.iter().any(|p| event.process_name.contains(p));
         
+        // Log write operations from potential editors for debugging
+        if event.process_name != "icaros" && event.process_name != "Finder" && 
+           (is_write_or_delete_op(&event.operation) || verbose) {
+            log_to_file(&format!("DEBUG: Process '{}' operation='{}' monitored={}", 
+                              event.process_name, event.operation, is_monitored));
+        }
+        
         if !is_monitored {
             if event.process_name != "icaros" && event.process_name != "Finder" {
                 if verbose {

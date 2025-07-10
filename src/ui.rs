@@ -1472,11 +1472,12 @@ fn render_file_guardian(
         })
         .collect();
 
-    // Add shield icon to title when monitoring is active
-    let title = if app.monitor.is_some() {
-        " 🦙🛡️ File Guardian 🦙 "
-    } else {
-        " 🦙 File Guardian 🦙 "
+    // Add shield icon to title when monitoring is active and show hidden files indicator
+    let title = match (app.monitor.is_some(), app.show_hidden) {
+        (true, true) => " 🦙🛡️ File Guardian [👁️ Hidden] 🦙 ",
+        (true, false) => " 🦙🛡️ File Guardian 🦙 ",
+        (false, true) => " 🦙 File Guardian [👁️ Hidden] 🦙 ",
+        (false, false) => " 🦙 File Guardian 🦙 ",
     };
     
     let list = List::new(items)
@@ -1905,21 +1906,22 @@ pub fn run_ui(mut app: App) -> Result<App> {
     // Set up file watcher
     let (tx, rx) = channel();
     let state_file_path = app.state_file.clone();
+    let verbose = app.verbose_logging;
     let mut watcher = notify::recommended_watcher(move |res: Result<NotifyEvent, notify::Error>| {
         if let Ok(event) = res {
             // Check if the .icaros file was modified
             let mut is_config_change = false;
             for path in &event.paths {
                 if path == &state_file_path {
-                    if app.verbose_logging {
-                        log_to_file("UI: Detected change to .icaros file");
-                    }
+                    // Always log config file changes for debugging
+                    log_to_file("UI: Detected change to .icaros file");
                     is_config_change = true;
                     break;
                 }
             }
             
             if is_config_change {
+                log_to_file("UI: Sending ConfigChanged event");
                 let _ = tx.send(FileWatchEvent::ConfigChanged);
             } else {
                 let _ = tx.send(FileWatchEvent::FileChanged);
@@ -2136,15 +2138,13 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
                 FileWatchEvent::ConfigChanged => {
-                    if app.verbose_logging {
-                        log_to_file("UI: Handling config change event");
-                    }
+                    // Always log config changes for debugging
+                    log_to_file("UI: Handling config change event");
                     // Reload the blocked processes from the config file
                     if app.enable_monitoring && app.monitor.is_some() {
                         if let Ok(state) = crate::state::AppState::load_from_file(&app.state_file) {
-                            if app.verbose_logging {
-                                log_to_file(&format!("UI: Reloading blocked processes: {:?}", state.blocked_processes));
-                            }
+                            // Always log the loaded processes for debugging
+                            log_to_file(&format!("UI: Loaded blocked processes from config: {:?}", state.blocked_processes));
                             
                             // Update the monitor with new blocked processes
                             if let Some(ref monitor) = app.monitor {
@@ -2153,6 +2153,29 @@ fn run_app<B: ratatui::backend::Backend>(
                                     app.monitor_events.push(fs_monitor::GuardianEvent::MonitorError(
                                         format!("Failed to update monitored processes: {}", e)
                                     ));
+                                }
+                                
+                                // IMPORTANT: Also update locked paths when config changes
+                                // First update the app's patterns from the loaded state
+                                app.explicitly_locked_paths.clear();
+                                app.explicitly_unlocked_paths.clear();
+                                
+                                for pattern in &state.locked_patterns {
+                                    if let Some(path) = pattern_to_path(&app.root_path, pattern) {
+                                        app.explicitly_locked_paths.push(path);
+                                    }
+                                }
+                                
+                                for pattern in &state.unlocked_patterns {
+                                    if let Some(path) = pattern_to_path(&app.root_path, pattern) {
+                                        app.explicitly_unlocked_paths.push(path);
+                                    }
+                                }
+                                
+                                // Now update the monitor with the new locked paths
+                                let locked_paths = app.get_locked_paths_from_patterns();
+                                if let Err(e) = monitor.update_locked_paths(locked_paths) {
+                                    log_to_file(&format!("UI: Failed to update locked paths: {}", e));
                                 }
                             }
                         }
@@ -2226,7 +2249,10 @@ fn run_app<B: ratatui::backend::Backend>(
                                     KeyCode::Char('r') => app.needs_refresh = true,
                                     KeyCode::Char('h') => {
                                         app.show_hidden = !app.show_hidden;
-                                        app.update_items();
+                                        // Rebuild the tree to include/exclude hidden files
+                                        if let Err(e) = app.refresh_tree() {
+                                            eprintln!("Error refreshing tree: {}", e);
+                                        }
                                     }
                                     // KeyCode::Char('m') => {
                                     //     log_to_file("UI: 'm' key pressed, calling toggle_monitoring");
@@ -2368,10 +2394,11 @@ fn render_compact_tabs(
     app: &App,
     area: Rect,
 ) {
-    let guardian_tab = if app.monitor.is_some() {
-        " 🦙🛡️ File Guardian "
-    } else {
-        " 🦙 File Guardian "
+    let guardian_tab = match (app.monitor.is_some(), app.show_hidden) {
+        (true, true) => " 🦙🛡️ File Guardian [👁️] ",
+        (true, false) => " 🦙🛡️ File Guardian ",
+        (false, true) => " 🦙 File Guardian [👁️] ",
+        (false, false) => " 🦙 File Guardian ",
     };
     
     let tab_titles = match app.active_tab {
